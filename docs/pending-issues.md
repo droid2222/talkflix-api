@@ -1,6 +1,6 @@
 # Pending Issues
 
-Last updated: 2026-05-01
+Last updated: 2026-06-05
 
 This file is the backend/infrastructure source of truth for open issues that still need coordinated work.
 
@@ -18,6 +18,7 @@ How to use it:
 - Current behavior:
   - LiveKit is deployed and audio rooms use the SFU path.
   - Current deployment relies on the existing LiveKit host/port setup and does not yet include TURN/TLS fallback.
+  - For v1 launch, this is explicitly accepted as a media reliability risk because direct-call real-device QA was user-reported as passing.
 - Current understanding:
   - This leaves a real reliability gap for restrictive Wi-Fi, symmetric NAT, and other networks where direct UDP paths are not enough.
   - App-side moderation/state fixes do not remove this infrastructure risk.
@@ -73,10 +74,12 @@ How to use it:
 ## 5. Backup and restore workflow is not yet formalized
 
 - Severity: P2
-- Status: Open
+- Status: Partially mitigated
 - Repos: `talkflix-api`
 - Current behavior:
-  - The app is running in production shape on the droplet, but backup/restore automation is not documented as a tested workflow in this repo.
+  - Production backup retention and manual cleanup are documented in `/Users/talkflix/talkflix_flutter/docs/production-backup-retention.md`.
+  - Old live-folder backup files were moved to a root-only archive on 2026-06-05 after creating a protected current snapshot.
+  - Automated MySQL dumps and a full restore drill are still not implemented.
 - Current understanding:
   - MySQL data, uploads, and droplet recovery need an explicit repeatable plan before launch-grade operations can be claimed.
 - Proposed solution:

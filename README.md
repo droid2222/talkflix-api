@@ -14,6 +14,37 @@ Node.js backend for Talkflix. This service provides:
 - Socket layer: [`socket.js`](./socket.js)
 - Production start script: [`start.sh`](./start.sh)
 
+## Admin dashboard
+
+- Public URL: `https://talkflix.cc/admin/`
+- `https://www.talkflix.cc/admin/` redirects to `https://talkflix.cc/admin/`
+- Production static HTML: `/var/www/talkflix-admin/index.html`
+- Production API path: `/opt/talkflix-api`
+- Full operational note in the Flutter repo: `/Users/talkflix/talkflix_flutter/docs/admin-dashboard.md`
+
+Anonymous match admin controls are implemented in:
+
+- [`server.js`](./server.js): routes under `/admin/anonymous-match/*`
+- [`socket.js`](./socket.js): in-memory anonymous match queue/history logic
+
+The emergency/test reset button calls `POST /admin/anonymous-match/reset-history`. It clears remembered anonymous pair history and skip cooldowns only; it does not end active matches or remove users waiting in the queue.
+
+## Mobile v1 release handoff
+
+The Flutter repository contains the current mobile release handoff:
+
+```text
+/Users/talkflix/talkflix_flutter/docs/v1-release-handoff.md
+```
+
+Read it before changing release-sensitive backend behavior. It documents the current mobile feature gates, IAP product IDs, purchase-verification environment requirements, direct-call behavior, migrations, and production launch blockers.
+
+Production database migration verification is documented in:
+
+```text
+docs/production-db-migrations.md
+```
+
 Scripts from [`package.json`](./package.json):
 
 ```bash
@@ -52,6 +83,13 @@ The code reads these environment variables:
 - `MAIL_FROM`
 - `RESEND_API_KEY`
 
+### Translation
+
+- `OPENAI_API_KEY`
+- `OPENAI_TRANSLATION_MODEL`
+  - optional
+  - defaults in code to `gpt-5-mini`
+
 ### Geo lookup
 
 - `GEO_PROVIDER`
@@ -64,11 +102,35 @@ The code reads these environment variables:
 - `LIVEKIT_API_KEY`
 - `LIVEKIT_API_SECRET`
 
+### Mobile in-app purchases
+
+- `IAP_PRO_PRODUCT_IDS`
+  - comma-separated product IDs
+  - default in code: `talkflix_pro_monthly,talkflix_pro_3_months,talkflix_pro_yearly`
+- `IAP_APPLE_BUNDLE_ID`
+  - default in code: `cc.talkflix.app`
+- `APPLE_IAP_ISSUER_ID`
+- `APPLE_IAP_KEY_ID`
+- `APPLE_IAP_PRIVATE_KEY`
+  - App Store Connect In-App Purchase API private key, with newlines escaped if stored inline
+- `APPLE_IAP_ENVIRONMENT`
+  - `auto`, `production`, or `sandbox`
+  - default in code: `auto`
+- `IAP_GOOGLE_PACKAGE_NAME`
+  - default in code: `cc.talkflix.app`
+- `GOOGLE_PLAY_SERVICE_ACCOUNT_JSON`
+  - full service-account JSON with Android Publisher API access
+- `GOOGLE_PLAY_SERVICE_ACCOUNT_FILE`
+  - alternative path to the service-account JSON file
+- `GOOGLE_PLAY_CLIENT_EMAIL` and `GOOGLE_PLAY_PRIVATE_KEY`
+  - alternative inline service-account credentials
+
 Notes:
 
 - If `LIVEKIT_URL` is omitted, the socket layer derives it from `PUBLIC_API_BASE_URL` as `wss://.../livekit`.
 - If `LIVEKIT_API_HOST` is omitted, it is derived from `LIVEKIT_URL`.
 - Live audio session issuance is enabled only when the full LiveKit config is present.
+- Pro subscriptions are granted only after the backend verifies the App Store or Google Play purchase. The mobile app never unlocks Pro from local purchase state alone.
 
 ## Minimal local `.env`
 
@@ -104,6 +166,27 @@ PUBLIC_API_BASE_URL=https://api.talkflix.cc
 LIVEKIT_API_HOST=http://127.0.0.1:7880
 LIVEKIT_API_KEY=change-me
 LIVEKIT_API_SECRET=change-me
+```
+
+For OpenAI-powered translation:
+
+```env
+OPENAI_API_KEY=sk-...
+OPENAI_TRANSLATION_MODEL=gpt-5-mini
+```
+
+For mobile Pro IAP:
+
+```env
+IAP_PRO_PRODUCT_IDS=talkflix_pro_monthly,talkflix_pro_3_months,talkflix_pro_yearly
+IAP_APPLE_BUNDLE_ID=cc.talkflix.app
+APPLE_IAP_ISSUER_ID=...
+APPLE_IAP_KEY_ID=...
+APPLE_IAP_PRIVATE_KEY="-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----"
+APPLE_IAP_ENVIRONMENT=auto
+
+IAP_GOOGLE_PACKAGE_NAME=cc.talkflix.app
+GOOGLE_PLAY_SERVICE_ACCOUNT_FILE=/opt/talkflix-api/google-play-service-account.json
 ```
 
 ## Local development
