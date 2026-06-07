@@ -106,7 +106,7 @@ The code reads these environment variables:
 
 - `IAP_PRO_PRODUCT_IDS`
   - comma-separated product IDs
-  - default in code: `talkflix_pro_monthly,talkflix_pro_3_months,talkflix_pro_yearly`
+  - default in code: `talkflix_pro_monthly,talkflix_pro_6_months,talkflix_pro_yearly`
 - `IAP_APPLE_BUNDLE_ID`
   - default in code: `cc.talkflix.app`
 - `APPLE_IAP_ISSUER_ID`
@@ -178,7 +178,7 @@ OPENAI_TRANSLATION_MODEL=gpt-5-mini
 For mobile Pro IAP:
 
 ```env
-IAP_PRO_PRODUCT_IDS=talkflix_pro_monthly,talkflix_pro_3_months,talkflix_pro_yearly
+IAP_PRO_PRODUCT_IDS=talkflix_pro_monthly,talkflix_pro_6_months,talkflix_pro_yearly
 IAP_APPLE_BUNDLE_ID=cc.talkflix.app
 APPLE_IAP_ISSUER_ID=...
 APPLE_IAP_KEY_ID=...

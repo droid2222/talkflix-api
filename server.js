@@ -105,7 +105,7 @@ const androidAppLinkTargets = [
 ];
 const defaultIapProProductIds = [
   "talkflix_pro_monthly",
-  "talkflix_pro_3_months",
+  "talkflix_pro_6_months",
   "talkflix_pro_yearly",
 ];
 const iapProProductIds = new Set(
