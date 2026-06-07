@@ -1,8 +1,20 @@
 # Production Database Migration Status
 
-Last verified: 2026-06-05
+Last verified: 2026-06-07
 
 This document records production schema checks that were performed for the v1 mobile release.
+
+## 2026-06-07 Pro Entitlements Migration
+
+`migrations/005_pro_entitlements_usage_mysql.sql` adds `user_daily_usage`, the backend daily counter table used by configurable free-plan limits.
+
+The backend also creates this table at startup through `ensureEntitlementTables`.
+
+Production verification after deploy:
+
+```text
+user_daily_usage:present
+```
 
 ## Verified Production Schema
 
@@ -48,6 +60,7 @@ receive_voice_calls|default=1|nullable=NO
 migrations/002_content_feed_upgrade_mysql.sql
 migrations/003_mobile_iap_purchases_mysql.sql
 migrations/004_direct_call_receive_defaults_mysql.sql
+migrations/005_pro_entitlements_usage_mysql.sql
 ```
 
 ## Handoff Rule

@@ -29,6 +29,13 @@ Anonymous match admin controls are implemented in:
 
 The emergency/test reset button calls `POST /admin/anonymous-match/reset-history`. It clears remembered anonymous pair history and skip cooldowns only; it does not end active matches or remove users waiting in the queue.
 
+Pro/free usage limit admin controls are implemented in:
+
+- [`server.js`](./server.js): routes under `/admin/pro-limits`, `/me/entitlements`, and `/me/usage/content-watch`
+- [`socket.js`](./socket.js): direct-call, live-room host, audience, and stage duration enforcement
+- [`entitlements.js`](./entitlements.js): default limits, app setting keys, daily usage helper, and quota accounting
+- [`migrations/005_pro_entitlements_usage_mysql.sql`](./migrations/005_pro_entitlements_usage_mysql.sql)
+
 ## Mobile v1 release handoff
 
 The Flutter repository contains the current mobile release handoff:

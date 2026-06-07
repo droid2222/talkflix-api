@@ -21,6 +21,18 @@ import {
   listSyntheticLiveBroadcasts,
   resetAnonymousMatchHistory,
 } from "./socket.js";
+import {
+  FREE_USAGE_LIMIT_KEYS,
+  assertDailyUsageAvailable,
+  consumeDailyUsage,
+  ensureEntitlementTables,
+  freeUsageSettingKey,
+  getDailyUsageState,
+  loadUserPlanIdentity,
+  normalizeFreeUsageLimitUpdate,
+  readFreeUsageLimits,
+  serializeFreeUsageLimits,
+} from "./entitlements.js";
 
 
 
@@ -2108,6 +2120,7 @@ const pool = mysql.createPool({
 
 
 async function ensureTables() {
+  await ensureEntitlementTables(pool);
   await pool.query(`
     CREATE TABLE IF NOT EXISTS content_items (
       id BIGINT NOT NULL AUTO_INCREMENT,
@@ -3159,6 +3172,67 @@ app.post("/admin/anonymous-match/reset-history", requireAuth, requireAdmin, asyn
   } catch (e) {
     console.error(e);
     return res.status(500).json({ message: "Failed to clear anonymous match history." });
+  }
+});
+
+app.get("/admin/pro-limits", requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const limits = await readFreeUsageLimits(pool);
+    return res.json({
+      ok: true,
+      freeUsageLimits: serializeFreeUsageLimits(limits),
+      resetPolicy: "utc_daily",
+    });
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ message: "Failed to load Pro limit settings." });
+  }
+});
+
+app.patch("/admin/pro-limits", requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const updates = normalizeFreeUsageLimitUpdate(req.body || {});
+    if (Object.keys(updates).length === 0) {
+      return res.status(400).json({ message: "At least one Pro limit setting is required." });
+    }
+    const auditActor = getAdminActor(req);
+    for (const [key, amount] of Object.entries(updates)) {
+      await pool.query(
+        `INSERT INTO app_settings (
+           setting_key,
+           setting_value,
+           updated_by_admin_id,
+           updated_by_admin_account_id
+         )
+         VALUES (?, ?, ?, ?)
+         ON DUPLICATE KEY UPDATE
+           setting_value = VALUES(setting_value),
+           updated_by_admin_id = VALUES(updated_by_admin_id),
+           updated_by_admin_account_id = VALUES(updated_by_admin_account_id),
+           updated_at = CURRENT_TIMESTAMP`,
+        [
+          freeUsageSettingKey(key),
+          String(amount),
+          auditActor.adminId || null,
+          auditActor.adminAccountId || null,
+        ]
+      );
+    }
+    await insertAdminAuditLog({
+      ...auditActor,
+      action: "update-pro-limits",
+      targetType: "app_setting",
+      details: { updates },
+    });
+    const limits = await readFreeUsageLimits(pool);
+    return res.json({
+      ok: true,
+      freeUsageLimits: serializeFreeUsageLimits(limits),
+      resetPolicy: "utc_daily",
+    });
+  } catch (e) {
+    console.error(e);
+    return res.status(400).json({ message: e?.message || "Failed to update Pro limit settings." });
   }
 });
 
@@ -13108,6 +13182,61 @@ app.post("/translations/text", requireAuth, async (req, res) => {
   }
 });
 
+app.get("/me/entitlements", requireAuth, async (req, res) => {
+  try {
+    const userId = Number(req.user?.sub || 0);
+    const identity = await loadUserPlanIdentity(pool, userId);
+    const limits = await readFreeUsageLimits(pool);
+    const freeUsageLimits = serializeFreeUsageLimits(limits);
+    const usage = {};
+    if (!identity.isProLike) {
+      for (const limit of freeUsageLimits) {
+        usage[limit.key] = await getDailyUsageState(pool, {
+          userId,
+          usageKey: limit.key,
+          limits,
+        });
+      }
+    }
+    return res.json({
+      ok: true,
+      plan: identity.plan,
+      role: identity.role,
+      isProLike: identity.isProLike,
+      resetPolicy: "utc_daily",
+      freeUsageLimits,
+      usage,
+    });
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ message: "Failed to load entitlements." });
+  }
+});
+
+app.post("/me/usage/content-watch", requireAuth, async (req, res) => {
+  try {
+    const userId = Number(req.user?.sub || 0);
+    const seconds = Math.max(1, Math.min(300, Math.round(Number(req.body?.seconds || 0))));
+    const result = await consumeDailyUsage(pool, {
+      userId,
+      usageKey: FREE_USAGE_LIMIT_KEYS.contentWatchSeconds,
+      amount: seconds,
+    });
+    if (!result.ok) {
+      return res.status(402).json({
+        ok: false,
+        code: result.code,
+        message: result.message,
+        usage: result.usage,
+      });
+    }
+    return res.json({ ok: true, usage: result.usage });
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ message: "Failed to record content watch time." });
+  }
+});
+
 app.patch("/users/:id/messages/read", requireAuth, async (req, res) => {
   try {
     const meId = Number(req.user.sub);
@@ -13379,6 +13508,19 @@ app.post("/users/:id/messages/:messageId/translate", requireAuth, async (req, re
     if (!text) {
       return res.status(400).json({ message: "Text is required." });
     }
+    const quota = await assertDailyUsageAvailable(pool, {
+      userId: meId,
+      usageKey: FREE_USAGE_LIMIT_KEYS.chatAiActions,
+      amount: 1,
+    });
+    if (!quota.ok) {
+      return res.status(402).json({
+        ok: false,
+        code: quota.code,
+        message: quota.message,
+        usage: quota.usage,
+      });
+    }
     const requestedTargetLanguage = String(
       req.body?.targetLanguage || ""
     ).trim();
@@ -13400,12 +13542,26 @@ app.post("/users/:id/messages/:messageId/translate", requireAuth, async (req, re
       sourceLanguage: "auto",
       context: "direct_chat_message",
     });
+    const consumedQuota = await consumeDailyUsage(pool, {
+      userId: meId,
+      usageKey: FREE_USAGE_LIMIT_KEYS.chatAiActions,
+      amount: 1,
+    });
+    if (!consumedQuota.ok) {
+      return res.status(402).json({
+        ok: false,
+        code: consumedQuota.code,
+        message: consumedQuota.message,
+        usage: consumedQuota.usage,
+      });
+    }
     return res.json({
       ok: true,
       translation,
       targetLanguage,
       note: `Translated to ${targetLanguage}.`,
       model: openAiTranslationModel,
+      usage: consumedQuota.usage,
     });
   } catch (e) {
     console.error("[translate:direct_message]", e);

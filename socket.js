@@ -3,6 +3,11 @@ import jwt from "jsonwebtoken";
 import { AccessToken, RoomServiceClient } from "livekit-server-sdk";
 import crypto from "crypto";
 import http2 from "http2";
+import {
+  FREE_USAGE_LIMIT_KEYS,
+  assertDailyUsageAvailable,
+  consumeDailyUsage,
+} from "./entitlements.js";
 
 const isProduction =
   String(process.env.NODE_ENV || "").trim().toLowerCase() === "production";
@@ -80,6 +85,7 @@ const queue = []; // waiting users
 const activeMatches = new Map(); // matchId -> { aUserId, bUserId, aSocketId, bSocketId, endsAt, timer }
 const pendingCalls = new Map(); // matchId -> { timer, fromUserId, requestedAt }
 const pendingDirectCalls = new Map(); // threadId -> { timer, fromUserId, requestedAt }
+const directCallUsageSessions = new Map(); // callId -> { userId, threadId, startedAt, timeout }
 const liveBroadcasts = new Map(); // broadcastId -> room state
 const liveUserSockets = new Map(); // userId -> socketId
 const presenceWatchers = new Map(); // watchedUserId -> Set(socketId)
@@ -211,6 +217,10 @@ function clearLivePollTimers(room) {
 
 function clearLiveRoomState(room) {
   clearLivePollTimers(room);
+  if (room?.hostUsage?.timeout) {
+    clearTimeout(room.hostUsage.timeout);
+    room.hostUsage = null;
+  }
 }
 
 function concludeLivePoll(io, broadcastId, pollId) {
@@ -563,6 +573,257 @@ function cleanupSkips() {
 
 function isProLike({ role, plan }) {
   return role === "admin" || plan === "pro" || plan === "trial";
+}
+
+function usageLimitSocketError(result) {
+  return {
+    ok: false,
+    code: result?.code || "FREE_USAGE_LIMIT_REACHED",
+    message:
+      result?.message ||
+      "Your free daily limit for this feature has been reached. Upgrade to Talkflix Pro for unlimited access.",
+    usage: result?.usage || null,
+    upgradeRequired: true,
+  };
+}
+
+function elapsedUsageSeconds(startedAt) {
+  const started = Number(startedAt || 0);
+  if (!started) return 0;
+  return Math.max(1, Math.ceil((Date.now() - started) / 1000));
+}
+
+async function assertFreeDurationAvailable(pool, userId, usageKey) {
+  return assertDailyUsageAvailable(pool, {
+    userId,
+    usageKey,
+    amount: 1,
+  });
+}
+
+async function finishSocketDurationUsage(pool, socket, dataKey) {
+  const entry = socket?.data?.[dataKey];
+  if (!entry) return null;
+  if (entry.timeout) clearTimeout(entry.timeout);
+  socket.data[dataKey] = null;
+  const seconds = elapsedUsageSeconds(entry.startedAt);
+  if (!seconds || entry.pro === true) return entry;
+  const result = await consumeDailyUsage(pool, {
+    userId: entry.userId,
+    usageKey: entry.usageKey,
+    amount: seconds,
+  });
+  return { ...entry, seconds, result };
+}
+
+async function finishLiveHostUsage(pool, room) {
+  const entry = room?.hostUsage;
+  if (!entry) return null;
+  if (entry.timeout) clearTimeout(entry.timeout);
+  room.hostUsage = null;
+  const seconds = elapsedUsageSeconds(entry.startedAt);
+  if (!seconds || entry.pro === true) return entry;
+  const result = await consumeDailyUsage(pool, {
+    userId: entry.userId,
+    usageKey: FREE_USAGE_LIMIT_KEYS.liveHostSeconds,
+    amount: seconds,
+  });
+  return { ...entry, seconds, result };
+}
+
+async function startLiveHostUsage(io, pool, room) {
+  const userId = String(room?.hostUserId || "");
+  const availability = await assertFreeDurationAvailable(
+    pool,
+    userId,
+    FREE_USAGE_LIMIT_KEYS.liveHostSeconds
+  );
+  if (!availability.ok) return availability;
+  if (availability.pro || availability.usage?.unlimited) {
+    room.hostUsage = { userId, pro: true };
+    return availability;
+  }
+  const remainingSeconds = Math.max(1, Number(availability.usage?.remainingAmount || 1));
+  const timeout = setTimeout(async () => {
+    const activeRoom = liveBroadcasts.get(String(room.id || ""));
+    if (!activeRoom) return;
+    await finishLiveHostUsage(pool, activeRoom);
+    io.to(`live:${activeRoom.id}`).emit("live:usage:limit-reached", {
+      broadcastId: activeRoom.id,
+      feature: "live_host",
+      message: "Free hosting time is finished for today. Upgrade to Talkflix Pro to host without limits.",
+    });
+    io.to(`live:${activeRoom.id}`).emit("live:broadcast:ended", {
+      broadcastId: activeRoom.id,
+      reason: "free_host_limit",
+    });
+    clearLiveRoomState(activeRoom);
+    liveBroadcasts.delete(activeRoom.id);
+    emitLiveBroadcastList(io);
+  }, remainingSeconds * 1000);
+  room.hostUsage = {
+    userId,
+    usageKey: FREE_USAGE_LIMIT_KEYS.liveHostSeconds,
+    startedAt: Date.now(),
+    timeout,
+  };
+  return availability;
+}
+
+async function startSocketDurationUsage(io, pool, socket, room, {
+  dataKey,
+  usageKey,
+  feature,
+  limitMessage,
+}) {
+  const userId = String(socket.user?.userId || "");
+  const availability = await assertFreeDurationAvailable(pool, userId, usageKey);
+  if (!availability.ok) return availability;
+  await finishSocketDurationUsage(pool, socket, dataKey);
+  if (availability.pro || availability.usage?.unlimited) {
+    socket.data[dataKey] = { userId, usageKey, pro: true };
+    return availability;
+  }
+  const remainingSeconds = Math.max(1, Number(availability.usage?.remainingAmount || 1));
+  const broadcastId = String(room?.id || "");
+  const timeout = setTimeout(async () => {
+    const activeRoom = liveBroadcasts.get(broadcastId);
+    await finishSocketDurationUsage(pool, socket, dataKey);
+    socket.emit("live:usage:limit-reached", {
+      broadcastId,
+      feature,
+      message: limitMessage,
+    });
+    if (!activeRoom) return;
+    const resolvedUserId = String(socket.user?.userId || "");
+    if (feature === "live_stage") {
+      const speaker = (activeRoom.speakers || []).find(
+        (item) => item && String(item.userId) === resolvedUserId
+      );
+      activeRoom.speakers = (activeRoom.speakers || []).map((item) =>
+        item && String(item.userId) === resolvedUserId ? null : item
+      );
+      if (speaker && !activeRoom.audienceMembers.some((member) => String(member.userId) === resolvedUserId)) {
+        activeRoom.audienceMembers.unshift({
+          userId: resolvedUserId,
+          name: speaker.name,
+          photo: speaker.photo || "",
+        });
+      }
+      bumpLiveSpeakerVersion(activeRoom);
+      await updateLivekitParticipantPermission(activeRoom, resolvedUserId, false);
+      emitLiveSpeaking(io, activeRoom, resolvedUserId, false);
+      socket.data.liveBroadcastRole = "audience";
+      const audienceUsage = await startSocketDurationUsage(io, pool, socket, activeRoom, {
+        dataKey: "liveAudienceUsage",
+        usageKey: FREE_USAGE_LIMIT_KEYS.liveAudienceSeconds,
+        feature: "live_audience",
+        limitMessage: "Free live room audience time is finished for today. Upgrade to Talkflix Pro for unlimited rooms.",
+      });
+      if (!audienceUsage.ok) {
+        activeRoom.audienceMembers = activeRoom.audienceMembers.filter(
+          (member) => String(member.userId) !== resolvedUserId
+        );
+        socket.leave(`live:${broadcastId}`);
+        socket.data.liveBroadcastId = null;
+        socket.data.liveBroadcastRole = null;
+        socket.emit("live:usage:limit-reached", {
+          broadcastId,
+          feature: "live_audience",
+          message: audienceUsage.message,
+          usage: audienceUsage.usage,
+        });
+      }
+    } else {
+      activeRoom.audienceMembers = activeRoom.audienceMembers.filter(
+        (member) => String(member.userId) !== resolvedUserId
+      );
+      socket.leave(`live:${broadcastId}`);
+      socket.data.liveBroadcastId = null;
+      socket.data.liveBroadcastRole = null;
+      bumpLiveRoomVersion(activeRoom);
+    }
+    activeRoom.comments.push({
+      id: `sys-${Date.now()}`,
+      author: "System",
+      text: feature === "live_stage"
+        ? "A speaker left the stage because their free daily stage time ended."
+        : "A listener left because their free daily audience time ended.",
+      ts: Date.now(),
+    });
+    emitLiveRoom(io, broadcastId);
+    emitLiveBroadcastList(io);
+  }, remainingSeconds * 1000);
+  socket.data[dataKey] = {
+    userId,
+    usageKey,
+    startedAt: Date.now(),
+    timeout,
+  };
+  return availability;
+}
+
+async function finishDirectCallUsage(pool, callId) {
+  const entry = directCallUsageSessions.get(String(callId || ""));
+  if (!entry) return null;
+  if (entry.timeout) clearTimeout(entry.timeout);
+  directCallUsageSessions.delete(String(callId || ""));
+  if (entry.pro === true) return entry;
+  const seconds = elapsedUsageSeconds(entry.startedAt);
+  if (!seconds) return entry;
+  const result = await consumeDailyUsage(pool, {
+    userId: entry.userId,
+    usageKey: FREE_USAGE_LIMIT_KEYS.directCallSeconds,
+    amount: seconds,
+  });
+  return { ...entry, seconds, result };
+}
+
+async function startDirectCallUsage(io, pool, session) {
+  const callId = String(session?.callId || "");
+  if (!callId || directCallUsageSessions.has(callId)) return { ok: true };
+  const callerId = String(session?.callerId || "");
+  const availability = await assertFreeDurationAvailable(
+    pool,
+    callerId,
+    FREE_USAGE_LIMIT_KEYS.directCallSeconds
+  );
+  if (!availability.ok) return availability;
+  if (availability.pro || availability.usage?.unlimited) {
+    directCallUsageSessions.set(callId, { userId: callerId, pro: true });
+    return availability;
+  }
+  const remainingSeconds = Math.max(1, Number(availability.usage?.remainingAmount || 1));
+  const threadId = String(session?.threadId || "");
+  const timeout = setTimeout(async () => {
+    const activeSession = await resolveDirectCallSession(pool, { callId, threadId });
+    await finishDirectCallUsage(pool, callId);
+    const updated = activeSession
+      ? await updateDirectCallSession(pool, callId, {
+          state: "ended",
+          endedAtNow: true,
+          endedByUserId: callerId,
+          allowedStates: ["accepted", "active"],
+        })
+      : null;
+    io.to(`dm:${threadId}`).emit("dm:call:end", buildDirectCallEventPayload(updated || activeSession, {
+      threadId,
+      fromUserId: callerId,
+      reason: "free_call_limit",
+    }));
+    io.to(`dm:${threadId}`).emit("dm:call:quota:ended", {
+      threadId,
+      callId,
+      message: "Free direct call time is finished for today. Upgrade to Talkflix Pro for unlimited direct calls.",
+    });
+  }, remainingSeconds * 1000);
+  directCallUsageSessions.set(callId, {
+    userId: callerId,
+    threadId,
+    startedAt: Date.now(),
+    timeout,
+  });
+  return availability;
 }
 
 function resolveExpectedSocketIdentity(payload = {}) {
@@ -2190,6 +2451,14 @@ export function attachSocket(server, pool, opts = {}) {
             message: "Direct calling is unavailable until relay transport is configured.",
           });
         }
+        const callQuota = await assertFreeDurationAvailable(
+          pool,
+          socket.user.userId,
+          FREE_USAGE_LIMIT_KEYS.directCallSeconds
+        );
+        if (!callQuota.ok) {
+          return ack?.(usageLimitSocketError(callQuota));
+        }
         const otherUserId = getOtherDirectThreadUserId(threadId, socket.user.userId);
         if (!otherUserId) return ack?.({ ok: false });
         const blockState = await getDirectBlockState(pool, socket.user.userId, otherUserId);
@@ -2556,6 +2825,21 @@ export function attachSocket(server, pool, opts = {}) {
         startedAtNow: true,
         allowedStates: ["accepted", "active"],
       });
+      const usageStart = await startDirectCallUsage(io, pool, updated || session);
+      if (!usageStart.ok) {
+        const ended = await updateDirectCallSession(pool, session.callId, {
+          state: "ended",
+          endedAtNow: true,
+          endedByUserId: session.callerId,
+          allowedStates: ["accepted", "active"],
+        });
+        io.to(`dm:${threadId}`).emit("dm:call:end", buildDirectCallEventPayload(ended || updated || session, {
+          threadId,
+          fromUserId: session.callerId,
+          reason: "free_call_limit",
+        }));
+        return ack?.(usageLimitSocketError(usageStart));
+      }
       io.to(`dm:${threadId}`).emit("dm:call:connected", buildDirectCallEventPayload(updated || session, {
         fromUserId: socket.user.userId,
       }));
@@ -2581,6 +2865,9 @@ export function attachSocket(server, pool, opts = {}) {
         socket.data.directCallId = null;
       }
       clearPendingDirectCall(io, threadId);
+      if (session?.callId) {
+        await finishDirectCallUsage(pool, session.callId);
+      }
       const updated = session
         ? await updateDirectCallSession(pool, session.callId, {
             state: "ended",
@@ -2650,6 +2937,14 @@ export function attachSocket(server, pool, opts = {}) {
       if (!cleanTitle) return ack?.({ ok: false, message: "title required" });
       if (cleanTitle.length > 55) return ack?.({ ok: false, message: "title too long" });
       const type = payload?.type === "video" ? "video" : "audio";
+      const hostQuota = await assertFreeDurationAvailable(
+        pool,
+        socket.user.userId,
+        FREE_USAGE_LIMIT_KEYS.liveHostSeconds
+      );
+      if (!hostQuota.ok) {
+        return ack?.(usageLimitSocketError(hostQuota));
+      }
       const isPrivate = payload?.isPrivate === true && isProLike(socket.user);
       const lang = String(payload?.lang || "English").trim().slice(0, 40);
       const lang2 = String(payload?.lang2 || "").trim().slice(0, 40);
@@ -2693,6 +2988,11 @@ export function attachSocket(server, pool, opts = {}) {
         speakingSeq: 0,
       };
       liveBroadcasts.set(roomId, room);
+      const hostUsage = await startLiveHostUsage(io, pool, room);
+      if (!hostUsage.ok) {
+        liveBroadcasts.delete(roomId);
+        return ack?.(usageLimitSocketError(hostUsage));
+      }
       socket.join(`live:${roomId}`);
       socket.data.liveBroadcastId = roomId;
       socket.data.liveBroadcastRole = "host";
@@ -2738,14 +3038,60 @@ export function attachSocket(server, pool, opts = {}) {
           room.capacityMessage || "Room full. Try the next broadcast."
         ));
       }
-      socket.join(`live:${broadcastId}`);
-      socket.data.liveBroadcastId = broadcastId;
       const userId = String(socket.user.userId);
       const isSpeaker = (room.speakers || []).some((speaker) => speaker && String(speaker.userId) === userId);
+      if (room.hostUserId !== userId && !isSpeaker) {
+        const audienceQuota = await assertFreeDurationAvailable(
+          pool,
+          userId,
+          FREE_USAGE_LIMIT_KEYS.liveAudienceSeconds
+        );
+        if (!audienceQuota.ok) {
+          return ack?.(usageLimitSocketError(audienceQuota));
+        }
+      }
+      socket.join(`live:${broadcastId}`);
+      socket.data.liveBroadcastId = broadcastId;
       socket.data.liveBroadcastRole = room.hostUserId === userId ? "host" : isSpeaker ? "speaker" : "audience";
       if (room.hostUserId !== userId && !isSpeaker && !room.audienceMembers.some((m) => String(m.userId) === userId)) {
         room.audienceMembers.unshift({ userId, name: String(name || `User ${userId}`), photo: photo || "" });
         bumpLiveRoomVersion(room);
+      }
+      if (room.hostUserId !== userId && !isSpeaker) {
+        const audienceUsage = await startSocketDurationUsage(io, pool, socket, room, {
+          dataKey: "liveAudienceUsage",
+          usageKey: FREE_USAGE_LIMIT_KEYS.liveAudienceSeconds,
+          feature: "live_audience",
+          limitMessage: "Free live room audience time is finished for today. Upgrade to Talkflix Pro for unlimited rooms.",
+        });
+        if (!audienceUsage.ok) {
+          socket.leave(`live:${broadcastId}`);
+          socket.data.liveBroadcastId = null;
+          socket.data.liveBroadcastRole = null;
+          room.audienceMembers = room.audienceMembers.filter((member) => String(member.userId) !== userId);
+          emitLiveRoom(io, broadcastId);
+          emitLiveBroadcastList(io);
+          return ack?.(usageLimitSocketError(audienceUsage));
+        }
+      }
+      if (room.hostUserId !== userId && isSpeaker) {
+        const stageUsage = await startSocketDurationUsage(io, pool, socket, room, {
+          dataKey: "liveStageUsage",
+          usageKey: FREE_USAGE_LIMIT_KEYS.liveStageSeconds,
+          feature: "live_stage",
+          limitMessage: "Free stage time is finished for today. Upgrade to Talkflix Pro for unlimited stage access.",
+        });
+        if (!stageUsage.ok) {
+          room.speakers = (room.speakers || []).map((speaker) =>
+            speaker && String(speaker.userId) === userId ? null : speaker
+          );
+          socket.leave(`live:${broadcastId}`);
+          socket.data.liveBroadcastId = null;
+          socket.data.liveBroadcastRole = null;
+          emitLiveRoom(io, broadcastId);
+          emitLiveBroadcastList(io);
+          return ack?.(usageLimitSocketError(stageUsage));
+        }
       }
       emitLiveRoom(io, broadcastId);
       emitLiveBroadcastList(io);
@@ -2816,14 +3162,17 @@ export function attachSocket(server, pool, opts = {}) {
       });
     });
 
-    socket.on("live:broadcast:leave", ({ broadcastId }, ack) => {
+    socket.on("live:broadcast:leave", async ({ broadcastId }, ack) => {
       const room = liveBroadcasts.get(broadcastId);
       socket.leave(`live:${broadcastId}`);
+      await finishSocketDurationUsage(pool, socket, "liveAudienceUsage");
+      await finishSocketDurationUsage(pool, socket, "liveStageUsage");
       socket.data.liveBroadcastId = null;
       socket.data.liveBroadcastRole = null;
       if (!room) return ack?.({ ok: true });
       const userId = String(socket.user.userId);
       if (room.hostUserId === userId) {
+        await finishLiveHostUsage(pool, room);
         io.to(`live:${broadcastId}`).emit("live:broadcast:ended", { broadcastId, reason: "host_left" });
         clearLiveRoomState(room);
         liveBroadcasts.delete(broadcastId);
@@ -3200,6 +3549,20 @@ export function attachSocket(server, pool, opts = {}) {
         return ack?.(liveAckError("request_not_found", "Stage request not found."));
       }
       if (accept) {
+        const stageQuota = await assertFreeDurationAvailable(
+          pool,
+          userId,
+          FREE_USAGE_LIMIT_KEYS.liveStageSeconds
+        );
+        if (!stageQuota.ok) {
+          io.to(`user:${userId}`).emit("live:usage:limit-reached", {
+            broadcastId,
+            feature: "live_stage",
+            message: stageQuota.message,
+            usage: stageQuota.usage,
+          });
+          return ack?.(usageLimitSocketError(stageQuota));
+        }
         room.joinRequests = room.joinRequests.filter((r) => String(r.userId) !== String(userId));
         if (room.type === "audio") {
           const openIndex = room.speakers.findIndex((s, index) => index > 0 && !s);
@@ -3242,6 +3605,22 @@ export function attachSocket(server, pool, opts = {}) {
             role: "Speaker",
             muted: false,
           };
+          const targetSocketId = liveUserSockets.get(String(userId));
+          const targetSocket = targetSocketId ? io.sockets.sockets.get(targetSocketId) : null;
+          if (targetSocket) {
+            await finishSocketDurationUsage(pool, targetSocket, "liveAudienceUsage");
+            targetSocket.data.liveBroadcastRole = "speaker";
+            const stageUsage = await startSocketDurationUsage(io, pool, targetSocket, room, {
+              dataKey: "liveStageUsage",
+              usageKey: FREE_USAGE_LIMIT_KEYS.liveStageSeconds,
+              feature: "live_stage",
+              limitMessage: "Free stage time is finished for today. Upgrade to Talkflix Pro for unlimited stage access.",
+            });
+            if (!stageUsage.ok) {
+              room.speakers[openIndex] = null;
+              return ack?.(usageLimitSocketError(stageUsage));
+            }
+          }
           room.audienceMembers = room.audienceMembers.filter((member) => String(member.userId) !== String(userId));
           room.comments.push({ id: `sys-${Date.now()}`, author: "System", text: `${req.name} joined the stage.`, ts: Date.now() });
           bumpLiveSpeakerVersion(room);
@@ -3302,6 +3681,19 @@ export function attachSocket(server, pool, opts = {}) {
       if (!approved) {
         return ack?.(liveAckError("stage_approval_not_found", "Stage approval not found."));
       }
+      const stageQuota = await assertFreeDurationAvailable(
+        pool,
+        userId,
+        FREE_USAGE_LIMIT_KEYS.liveStageSeconds
+      );
+      if (!stageQuota.ok) {
+        room.pendingStageApprovals = (room.pendingStageApprovals || []).filter(
+          (item) => String(item.userId) !== userId
+        );
+        bumpLiveRoomVersion(room);
+        emitLiveRoom(io, broadcastId);
+        return ack?.(usageLimitSocketError(stageQuota));
+      }
       const alreadySpeaker = (room.speakers || []).some(
         (speaker) => speaker && String(speaker.userId) === userId
       );
@@ -3331,9 +3723,26 @@ export function attachSocket(server, pool, opts = {}) {
       room.audienceMembers = room.audienceMembers.filter(
         (member) => String(member.userId) !== userId
       );
+      await finishSocketDurationUsage(pool, socket, "liveAudienceUsage");
       socket.data.liveBroadcastRole = "speaker";
       bumpLiveSpeakerVersion(room);
       await updateLivekitParticipantPermission(room, userId, true);
+      const stageUsage = await startSocketDurationUsage(io, pool, socket, room, {
+        dataKey: "liveStageUsage",
+        usageKey: FREE_USAGE_LIMIT_KEYS.liveStageSeconds,
+        feature: "live_stage",
+        limitMessage: "Free stage time is finished for today. Upgrade to Talkflix Pro for unlimited stage access.",
+      });
+      if (!stageUsage.ok) {
+        room.speakers = (room.speakers || []).map((speaker) =>
+          speaker && String(speaker.userId) === userId ? null : speaker
+        );
+        socket.data.liveBroadcastRole = "audience";
+        await updateLivekitParticipantPermission(room, userId, false);
+        bumpLiveSpeakerVersion(room);
+        emitLiveRoom(io, broadcastId);
+        return ack?.(usageLimitSocketError(stageUsage));
+      }
       const mediaSession = await emitLiveMediaSession(io, room, userId, approved.name);
       emitLiveRoom(io, broadcastId);
       ack?.({
@@ -3360,6 +3769,7 @@ export function attachSocket(server, pool, opts = {}) {
       if (!speaker) {
         return ack?.(liveAckError("target_not_on_stage", "You are not on stage."));
       }
+      await finishSocketDurationUsage(pool, socket, "liveStageUsage");
       room.speakers = (room.speakers || []).map((s) => (s && String(s.userId) === userId ? null : s));
       if (speaker && !room.audienceMembers.some((member) => String(member.userId) === userId)) {
         room.audienceMembers.unshift({ userId, name: speaker.name, photo: speaker.photo || "" });
@@ -3370,8 +3780,23 @@ export function attachSocket(server, pool, opts = {}) {
       bumpLiveSpeakerVersion(room);
       socket.data.liveBroadcastRole = "audience";
       await updateLivekitParticipantPermission(room, userId, false);
+      const audienceUsage = await startSocketDurationUsage(io, pool, socket, room, {
+        dataKey: "liveAudienceUsage",
+        usageKey: FREE_USAGE_LIMIT_KEYS.liveAudienceSeconds,
+        feature: "live_audience",
+        limitMessage: "Free live room audience time is finished for today. Upgrade to Talkflix Pro for unlimited rooms.",
+      });
+      if (!audienceUsage.ok) {
+        room.audienceMembers = room.audienceMembers.filter((member) => String(member.userId) !== userId);
+        socket.leave(`live:${broadcastId}`);
+        socket.data.liveBroadcastId = null;
+        socket.data.liveBroadcastRole = null;
+      }
       emitLiveSpeaking(io, room, userId, false);
       emitLiveRoom(io, broadcastId);
+      if (!audienceUsage.ok) {
+        return ack?.(usageLimitSocketError(audienceUsage));
+      }
       ack?.({ ok: true, broadcast: serializeBroadcast(room) });
       };
       finish().catch((error) => {
@@ -3428,6 +3853,11 @@ export function attachSocket(server, pool, opts = {}) {
         });
         return ack?.(liveAckError("target_not_on_stage", "Participant is not on stage."));
       }
+      const targetSocketId = liveUserSockets.get(userId);
+      const targetSocket = targetSocketId ? io.sockets.sockets.get(targetSocketId) : null;
+      if (targetSocket) {
+        await finishSocketDurationUsage(pool, targetSocket, "liveStageUsage");
+      }
       room.speakers = (room.speakers || []).map((item) =>
         item && String(item.userId) === userId ? null : item
       );
@@ -3446,6 +3876,27 @@ export function attachSocket(server, pool, opts = {}) {
       });
       bumpLiveSpeakerVersion(room);
       await updateLivekitParticipantPermission(room, userId, false);
+      if (targetSocket) {
+        targetSocket.data.liveBroadcastRole = "audience";
+        const audienceUsage = await startSocketDurationUsage(io, pool, targetSocket, room, {
+          dataKey: "liveAudienceUsage",
+          usageKey: FREE_USAGE_LIMIT_KEYS.liveAudienceSeconds,
+          feature: "live_audience",
+          limitMessage: "Free live room audience time is finished for today. Upgrade to Talkflix Pro for unlimited rooms.",
+        });
+        if (!audienceUsage.ok) {
+          room.audienceMembers = room.audienceMembers.filter((member) => String(member.userId) !== userId);
+          targetSocket.leave(`live:${broadcastId}`);
+          targetSocket.data.liveBroadcastId = null;
+          targetSocket.data.liveBroadcastRole = null;
+          targetSocket.emit("live:usage:limit-reached", {
+            broadcastId,
+            feature: "live_audience",
+            message: audienceUsage.message,
+            usage: audienceUsage.usage,
+          });
+        }
+      }
       emitLiveSpeaking(io, room, userId, false);
       emitLiveRoom(io, broadcastId);
       auditLiveModeration("speaker_remove", {
@@ -3573,10 +4024,13 @@ export function attachSocket(server, pool, opts = {}) {
         } else if (room) {
           const userId = String(socket.user.userId);
           if (room.hostUserId === userId) {
+            await finishLiveHostUsage(pool, room);
             io.to(`live:${broadcastId}`).emit("live:broadcast:ended", { broadcastId, reason: "host_left" });
             clearLiveRoomState(room);
             liveBroadcasts.delete(broadcastId);
           } else {
+            await finishSocketDurationUsage(pool, socket, "liveAudienceUsage");
+            await finishSocketDurationUsage(pool, socket, "liveStageUsage");
             room.audienceMembers = room.audienceMembers.filter((m) => String(m.userId) !== userId);
             room.joinRequests = room.joinRequests.filter((r) => String(r.userId) !== userId);
             room.pendingStageApprovals = (room.pendingStageApprovals || []).filter(
@@ -3606,6 +4060,9 @@ export function attachSocket(server, pool, opts = {}) {
           callId: socket.data.directCallId,
           threadId,
         });
+        if (session?.callId) {
+          await finishDirectCallUsage(pool, session.callId);
+        }
         const updated = session
           ? await updateDirectCallSession(pool, session.callId, {
               state: "ended",
