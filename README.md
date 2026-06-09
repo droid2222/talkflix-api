@@ -58,7 +58,10 @@ Production status on 2026-06-09:
 
 - `/commerce/products` is deployed and returns `one_on_one_coaching`.
 - `/commerce/checkout-sessions` is deployed but cannot create real checkout sessions until `STRIPE_SECRET_KEY` is set.
+- `/admin/commerce/stripe-config` is deployed so a super admin can save/clear the Stripe secret key and webhook secret from the admin dashboard.
+- Dashboard-saved Stripe secrets are encrypted in `app_settings`, masked on read, and never returned to the browser after saving.
 - Production backup before deploying these routes: `/root/talkflix-production-backups/20260609-homepage-commerce-api/server.js.before`.
+- Production backup before adding dashboard Stripe settings: `/root/talkflix-production-backups/20260609-admin-stripe-config/server.js.before`.
 
 ## Mobile v1 release handoff
 
@@ -158,6 +161,9 @@ The code reads these environment variables:
 
 ### Web commerce / Stripe
 
+- `SECRET_ENCRYPTION_KEY`
+  - recommended stable server-side key for encrypting dashboard-saved secrets
+  - fallback order is `SECRET_ENCRYPTION_KEY`, `APP_SECRET`, then `JWT_SECRET`
 - `STRIPE_SECRET_KEY`
   - required before real Stripe Checkout sessions can be created
 - `STRIPE_WEBHOOK_SECRET`

@@ -75,7 +75,7 @@ app.use(cors({
 }));
 app.post("/stripe/webhook", express.raw({ type: "application/json" }), async (req, res) => {
   try {
-    const event = parseStripeWebhookEvent(req);
+    const event = await parseStripeWebhookEvent(req);
     if (!event) {
       return res.status(400).json({ message: "Invalid Stripe webhook." });
     }
@@ -123,10 +123,11 @@ const publicSharePreviewSeconds = parseBoundedInt(
   3,
   30
 );
-const stripeSecretKey = String(process.env.STRIPE_SECRET_KEY || "").trim();
-const stripeWebhookSecret = String(process.env.STRIPE_WEBHOOK_SECRET || "").trim();
 const stripeCheckoutSessionsUrl = "https://api.stripe.com/v1/checkout/sessions";
 const defaultCommerceProductId = "one_on_one_coaching";
+const STRIPE_SECRET_KEY_SETTING_KEY = "stripe_secret_key";
+const STRIPE_WEBHOOK_SECRET_SETTING_KEY = "stripe_webhook_secret";
+const ENCRYPTED_APP_SECRET_PREFIX = "enc:v1:";
 const commerceProductTypes = new Set([
   "coaching_session",
   "ebook",
@@ -872,6 +873,189 @@ async function readAnonymousMatchZeroCooldownSetting() {
   }
 }
 
+function getAppSecretEncryptionKey() {
+  const material = String(
+    process.env.SECRET_ENCRYPTION_KEY ||
+      process.env.APP_SECRET ||
+      process.env.JWT_SECRET ||
+      ""
+  ).trim();
+  if (!material) return null;
+  return crypto
+    .createHash("sha256")
+    .update(`talkflix-app-setting-secret:${material}`)
+    .digest();
+}
+
+function encryptAppSecret(value) {
+  const secret = String(value || "").trim();
+  if (!secret) return "";
+  const key = getAppSecretEncryptionKey();
+  if (!key) {
+    const error = new Error("SECRET_ENCRYPTION_KEY, APP_SECRET, or JWT_SECRET is required before saving secrets.");
+    error.statusCode = 500;
+    throw error;
+  }
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv("aes-256-gcm", key, iv);
+  const encrypted = Buffer.concat([cipher.update(secret, "utf8"), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  return `${ENCRYPTED_APP_SECRET_PREFIX}${Buffer.concat([iv, tag, encrypted]).toString("base64")}`;
+}
+
+function decryptAppSecret(value) {
+  const stored = String(value || "").trim();
+  if (!stored) return "";
+  if (!stored.startsWith(ENCRYPTED_APP_SECRET_PREFIX)) {
+    return stored;
+  }
+  const key = getAppSecretEncryptionKey();
+  if (!key) {
+    throw new Error("Saved secret cannot be decrypted because no server encryption key is configured.");
+  }
+  const payload = Buffer.from(stored.slice(ENCRYPTED_APP_SECRET_PREFIX.length), "base64");
+  if (payload.length <= 28) {
+    throw new Error("Saved secret payload is invalid.");
+  }
+  const iv = payload.subarray(0, 12);
+  const tag = payload.subarray(12, 28);
+  const encrypted = payload.subarray(28);
+  const decipher = crypto.createDecipheriv("aes-256-gcm", key, iv);
+  decipher.setAuthTag(tag);
+  return Buffer.concat([decipher.update(encrypted), decipher.final()]).toString("utf8");
+}
+
+async function readAppSettingValue(settingKey) {
+  const [rows] = await pool.query(
+    `SELECT setting_value
+     FROM app_settings
+     WHERE setting_key = ?
+     LIMIT 1`,
+    [settingKey]
+  );
+  return rows?.length ? String(rows[0].setting_value || "") : "";
+}
+
+async function writeAppSettingValue(settingKey, settingValue, actor) {
+  await pool.query(
+    `INSERT INTO app_settings (
+       setting_key,
+       setting_value,
+       updated_by_admin_id,
+       updated_by_admin_account_id
+     )
+     VALUES (?, ?, ?, ?)
+     ON DUPLICATE KEY UPDATE
+       setting_value = VALUES(setting_value),
+       updated_by_admin_id = VALUES(updated_by_admin_id),
+       updated_by_admin_account_id = VALUES(updated_by_admin_account_id),
+       updated_at = CURRENT_TIMESTAMP`,
+    [
+      settingKey,
+      String(settingValue || ""),
+      actor?.adminId || null,
+      actor?.adminAccountId || null,
+    ]
+  );
+}
+
+async function deleteAppSettingValue(settingKey) {
+  await pool.query(`DELETE FROM app_settings WHERE setting_key = ?`, [settingKey]);
+}
+
+async function readStoredSecretSetting(settingKey) {
+  const stored = await readAppSettingValue(settingKey);
+  return stored ? decryptAppSecret(stored) : "";
+}
+
+async function writeStoredSecretSetting(settingKey, secret, actor) {
+  await writeAppSettingValue(settingKey, encryptAppSecret(secret), actor);
+}
+
+function maskSecretValue(value) {
+  const secret = String(value || "").trim();
+  if (!secret) return "";
+  if (secret.length <= 10) return "••••";
+  return `${secret.slice(0, 7)}…${secret.slice(-4)}`;
+}
+
+function validateStripeSecretKeyInput(value) {
+  const secret = String(value || "").trim();
+  if (!secret) return "";
+  if (!secret.startsWith("sk_live_") && !secret.startsWith("sk_test_")) {
+    const error = new Error("Stripe secret key must start with sk_live_ or sk_test_.");
+    error.statusCode = 400;
+    throw error;
+  }
+  if (secret.length < 20 || secret.length > 240) {
+    const error = new Error("Stripe secret key length is invalid.");
+    error.statusCode = 400;
+    throw error;
+  }
+  return secret;
+}
+
+function validateStripeWebhookSecretInput(value) {
+  const secret = String(value || "").trim();
+  if (!secret) return "";
+  if (!secret.startsWith("whsec_")) {
+    const error = new Error("Stripe webhook secret must start with whsec_.");
+    error.statusCode = 400;
+    throw error;
+  }
+  if (secret.length < 16 || secret.length > 240) {
+    const error = new Error("Stripe webhook secret length is invalid.");
+    error.statusCode = 400;
+    throw error;
+  }
+  return secret;
+}
+
+async function readEffectiveStripeSecretKey() {
+  const envValue = String(process.env.STRIPE_SECRET_KEY || "").trim();
+  if (envValue) return { value: envValue, source: "env" };
+  const storedValue = await readStoredSecretSetting(STRIPE_SECRET_KEY_SETTING_KEY);
+  return { value: storedValue, source: storedValue ? "dashboard" : "none" };
+}
+
+async function readEffectiveStripeWebhookSecret() {
+  const envValue = String(process.env.STRIPE_WEBHOOK_SECRET || "").trim();
+  if (envValue) return { value: envValue, source: "env" };
+  const storedValue = await readStoredSecretSetting(STRIPE_WEBHOOK_SECRET_SETTING_KEY);
+  return { value: storedValue, source: storedValue ? "dashboard" : "none" };
+}
+
+function serializeStripeSecretStatus(config) {
+  const value = String(config?.value || "").trim();
+  const source = String(config?.source || "none");
+  return {
+    configured: Boolean(value),
+    source: value ? source : "none",
+    masked: value ? maskSecretValue(value) : "",
+    mode: value.startsWith("sk_live_")
+      ? "live"
+      : value.startsWith("sk_test_")
+        ? "test"
+        : value.startsWith("whsec_")
+          ? "webhook"
+          : "",
+    envLocked: source === "env",
+  };
+}
+
+async function buildStripeAdminConfigStatus() {
+  const secretKey = await readEffectiveStripeSecretKey();
+  const webhookSecret = await readEffectiveStripeWebhookSecret();
+  return {
+    secretKey: serializeStripeSecretStatus(secretKey),
+    webhookSecret: serializeStripeSecretStatus(webhookSecret),
+    checkoutReady: Boolean(secretKey.value),
+    webhookReady: Boolean(webhookSecret.value),
+    paymentReady: Boolean(secretKey.value && webhookSecret.value),
+    publicWebBaseUrl,
+  };
+}
+
 async function insertAdminAuditLog({ adminId, adminAccountId = null, action, targetType = null, targetId = null, details = null }) {
   try {
     await pool.query(
@@ -1239,8 +1423,9 @@ function buildCommerceReturnUrl(status) {
   return `${publicWebBaseUrl}/coaching?checkout=${normalizedStatus}`;
 }
 
-function verifyStripeWebhookSignature(rawBody, signatureHeader) {
-  if (!stripeWebhookSecret) {
+async function verifyStripeWebhookSignature(rawBody, signatureHeader) {
+  const { value: webhookSecret } = await readEffectiveStripeWebhookSecret();
+  if (!webhookSecret) {
     if (isProduction) {
       throw new Error("STRIPE_WEBHOOK_SECRET is required in production.");
     }
@@ -1259,7 +1444,7 @@ function verifyStripeWebhookSignature(rawBody, signatureHeader) {
   if (!timestamp || !signature) return false;
   const payload = `${timestamp}.${rawBody.toString("utf8")}`;
   const expected = crypto
-    .createHmac("sha256", stripeWebhookSecret)
+    .createHmac("sha256", webhookSecret)
     .update(payload)
     .digest("hex");
   const expectedBuffer = Buffer.from(expected, "hex");
@@ -1268,17 +1453,18 @@ function verifyStripeWebhookSignature(rawBody, signatureHeader) {
   return crypto.timingSafeEqual(expectedBuffer, signatureBuffer);
 }
 
-function parseStripeWebhookEvent(req) {
+async function parseStripeWebhookEvent(req) {
   const rawBody = Buffer.isBuffer(req.body)
     ? req.body
     : Buffer.from(JSON.stringify(req.body || {}), "utf8");
-  const valid = verifyStripeWebhookSignature(rawBody, req.headers["stripe-signature"]);
+  const valid = await verifyStripeWebhookSignature(rawBody, req.headers["stripe-signature"]);
   if (!valid) return null;
   return JSON.parse(rawBody.toString("utf8"));
 }
 
 async function createStripeCheckoutSession({ product, orderId }) {
-  if (!stripeSecretKey) {
+  const { value: secretKey } = await readEffectiveStripeSecretKey();
+  if (!secretKey) {
     const error = new Error("STRIPE_SECRET_KEY is not configured.");
     error.statusCode = 503;
     throw error;
@@ -1301,7 +1487,7 @@ async function createStripeCheckoutSession({ product, orderId }) {
   const response = await fetch(stripeCheckoutSessionsUrl, {
     method: "POST",
     headers: {
-      Authorization: `Bearer ${stripeSecretKey}`,
+      Authorization: `Bearer ${secretKey}`,
       "Content-Type": "application/x-www-form-urlencoded",
     },
     body: params,
@@ -2946,7 +3132,7 @@ async function ensureTables() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS app_settings (
       setting_key VARCHAR(80) NOT NULL,
-      setting_value VARCHAR(255) NOT NULL,
+      setting_value TEXT NOT NULL,
       updated_by_admin_id INT NULL,
       updated_by_admin_account_id BIGINT NULL,
       updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
@@ -2954,6 +3140,9 @@ async function ensureTables() {
       KEY idx_app_settings_updated_at (updated_at)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
   `);
+  await pool.query(`ALTER TABLE app_settings MODIFY COLUMN setting_value TEXT NOT NULL`).catch((error) => {
+    if (error?.code !== "ER_BAD_FIELD_ERROR") console.error(error);
+  });
   await pool.query(`
     CREATE TABLE IF NOT EXISTS iap_purchases (
       id BIGINT NOT NULL AUTO_INCREMENT,
@@ -3341,6 +3530,74 @@ app.post("/commerce/checkout-sessions", async (req, res) => {
     return res
       .status(e?.statusCode || 500)
       .json({ message: e?.message || "Failed to start checkout." });
+  }
+});
+
+app.get("/admin/commerce/stripe-config", requireAuth, requireAdmin, async (req, res) => {
+  try {
+    return res.json({
+      ok: true,
+      stripe: await buildStripeAdminConfigStatus(),
+    });
+  } catch (e) {
+    console.error("[admin-stripe-config] failed", e);
+    return res.status(500).json({ message: "Failed to load Stripe configuration status." });
+  }
+});
+
+app.patch("/admin/commerce/stripe-config", requireAuth, requireAdmin, requireSuperAdmin, async (req, res) => {
+  try {
+    const body = req.body || {};
+    const actor = getAdminActor(req);
+    const updates = {
+      secretKeyUpdated: false,
+      secretKeyCleared: false,
+      webhookSecretUpdated: false,
+      webhookSecretCleared: false,
+    };
+
+    if (body.clearSecretKey === true) {
+      await deleteAppSettingValue(STRIPE_SECRET_KEY_SETTING_KEY);
+      updates.secretKeyCleared = true;
+    } else if (Object.prototype.hasOwnProperty.call(body, "secretKey")) {
+      const secretKey = validateStripeSecretKeyInput(body.secretKey);
+      if (secretKey) {
+        await writeStoredSecretSetting(STRIPE_SECRET_KEY_SETTING_KEY, secretKey, actor);
+        updates.secretKeyUpdated = true;
+      }
+    }
+
+    if (body.clearWebhookSecret === true) {
+      await deleteAppSettingValue(STRIPE_WEBHOOK_SECRET_SETTING_KEY);
+      updates.webhookSecretCleared = true;
+    } else if (Object.prototype.hasOwnProperty.call(body, "webhookSecret")) {
+      const webhookSecret = validateStripeWebhookSecretInput(body.webhookSecret);
+      if (webhookSecret) {
+        await writeStoredSecretSetting(STRIPE_WEBHOOK_SECRET_SETTING_KEY, webhookSecret, actor);
+        updates.webhookSecretUpdated = true;
+      }
+    }
+
+    if (!Object.values(updates).some(Boolean)) {
+      return res.status(400).json({ message: "Provide a Stripe secret to save or choose a secret to clear." });
+    }
+
+    await insertAdminAuditLog({
+      ...actor,
+      action: "update-commerce-stripe-config",
+      targetType: "app_setting",
+      details: updates,
+    });
+
+    return res.json({
+      ok: true,
+      stripe: await buildStripeAdminConfigStatus(),
+    });
+  } catch (e) {
+    console.error("[admin-stripe-config-update] failed", e);
+    return res
+      .status(e?.statusCode || 500)
+      .json({ message: e?.message || "Failed to update Stripe configuration." });
   }
 });
 
