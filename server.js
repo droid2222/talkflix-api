@@ -73,6 +73,19 @@ app.use(cors({
   },
   credentials: true,
 }));
+app.post("/stripe/webhook", express.raw({ type: "application/json" }), async (req, res) => {
+  try {
+    const event = parseStripeWebhookEvent(req);
+    if (!event) {
+      return res.status(400).json({ message: "Invalid Stripe webhook." });
+    }
+    await handleStripeWebhookEvent(event);
+    return res.json({ received: true });
+  } catch (e) {
+    console.error("[stripe-webhook] failed", e);
+    return res.status(400).json({ message: "Stripe webhook failed." });
+  }
+});
 app.use(express.json({ limit: "50mb" }));
 app.use(express.urlencoded({ extended: true, limit: "50mb" }));
 
@@ -96,12 +109,30 @@ const publicShareBaseUrl =
   String(process.env.PUBLIC_SHARE_BASE_URL || "https://www.talkflix.cc")
     .trim()
     .replace(/\/$/, "") || "https://www.talkflix.cc";
+const publicWebBaseUrl =
+  String(
+    process.env.PUBLIC_WEB_BASE_URL ||
+      process.env.PUBLIC_SHARE_BASE_URL ||
+      "https://www.talkflix.cc"
+  )
+    .trim()
+    .replace(/\/$/, "") || "https://www.talkflix.cc";
 const publicSharePreviewSeconds = parseBoundedInt(
   process.env.PUBLIC_SHARE_PREVIEW_SECONDS,
   8,
   3,
   30
 );
+const stripeSecretKey = String(process.env.STRIPE_SECRET_KEY || "").trim();
+const stripeWebhookSecret = String(process.env.STRIPE_WEBHOOK_SECRET || "").trim();
+const stripeCheckoutSessionsUrl = "https://api.stripe.com/v1/checkout/sessions";
+const defaultCommerceProductId = "one_on_one_coaching";
+const commerceProductTypes = new Set([
+  "coaching_session",
+  "ebook",
+  "podcast_subscription",
+  "digital_product",
+]);
 const iosAssociatedDomainAppIds = ["VPZ2LX24TZ.cc.talkflix.app"];
 const androidAppLinkTargets = [
   {
@@ -1116,6 +1147,224 @@ function isAllowedIapProductId(productId) {
 
 function sha256Hex(value) {
   return crypto.createHash("sha256").update(String(value || "")).digest("hex");
+}
+
+function envFlag(name, fallback = false) {
+  const raw = String(process.env[name] ?? "").trim().toLowerCase();
+  if (!raw) return fallback;
+  if (["1", "true", "yes", "on"].includes(raw)) return true;
+  if (["0", "false", "no", "off"].includes(raw)) return false;
+  return fallback;
+}
+
+function normalizeCommerceProductType(value) {
+  const normalized = String(value || "").trim().toLowerCase();
+  return commerceProductTypes.has(normalized) ? normalized : "digital_product";
+}
+
+function normalizeCommerceCurrency(value) {
+  const normalized = String(value || "usd").trim().toLowerCase();
+  return /^[a-z]{3}$/.test(normalized) ? normalized : "usd";
+}
+
+function formatCommercePriceLabel(currency, amountCents) {
+  try {
+    return new Intl.NumberFormat("en-US", {
+      style: "currency",
+      currency: String(currency || "usd").toUpperCase(),
+    }).format(Number(amountCents || 0) / 100);
+  } catch {
+    return `$${(Number(amountCents || 0) / 100).toFixed(2)}`;
+  }
+}
+
+function sanitizeCommerceText(value, maxLength = 1000) {
+  return String(value || "").trim().slice(0, maxLength);
+}
+
+function buildCommerceProducts() {
+  const currency = normalizeCommerceCurrency(process.env.COACHING_CURRENCY || "usd");
+  const amountCents = parseBoundedInt(
+    process.env.COACHING_PRICE_CENTS,
+    2800,
+    100,
+    1000000
+  );
+  const coachingProduct = {
+    id: defaultCommerceProductId,
+    type: "coaching_session",
+    title: sanitizeCommerceText(process.env.COACHING_PRODUCT_TITLE || "1-on-1 Coaching", 160),
+    subtitle: sanitizeCommerceText(
+      process.env.COACHING_PRODUCT_SUBTITLE ||
+        "Personal clarity, strategy, and next-step guidance.",
+      240
+    ),
+    description: sanitizeCommerceText(
+      process.env.COACHING_PRODUCT_DESCRIPTION ||
+        "A focused private coaching session with David Nwako.",
+      1000
+    ),
+    currency,
+    amountCents,
+    priceLabel: formatCommercePriceLabel(currency, amountCents),
+    mode: "payment",
+    active: envFlag("COACHING_PRODUCT_ACTIVE", true),
+  };
+  return [coachingProduct];
+}
+
+function publicCommerceProduct(product) {
+  return {
+    id: product.id,
+    type: product.type,
+    title: product.title,
+    subtitle: product.subtitle,
+    description: product.description,
+    currency: String(product.currency || "usd").toUpperCase(),
+    amountCents: product.amountCents,
+    priceLabel: product.priceLabel,
+    active: product.active === true,
+  };
+}
+
+function findActiveCommerceProduct(productId) {
+  const normalizedId = String(productId || "").trim();
+  return buildCommerceProducts().find(
+    (product) => product.id === normalizedId && product.active === true
+  );
+}
+
+function buildCommerceReturnUrl(status) {
+  const normalizedStatus = status === "success" ? "success" : "cancelled";
+  return `${publicWebBaseUrl}/coaching?checkout=${normalizedStatus}`;
+}
+
+function verifyStripeWebhookSignature(rawBody, signatureHeader) {
+  if (!stripeWebhookSecret) {
+    if (isProduction) {
+      throw new Error("STRIPE_WEBHOOK_SECRET is required in production.");
+    }
+    return true;
+  }
+  const header = String(signatureHeader || "");
+  const parts = Object.fromEntries(
+    header
+      .split(",")
+      .map((part) => part.split("="))
+      .filter((part) => part.length === 2)
+      .map(([key, value]) => [key.trim(), value.trim()])
+  );
+  const timestamp = parts.t;
+  const signature = parts.v1;
+  if (!timestamp || !signature) return false;
+  const payload = `${timestamp}.${rawBody.toString("utf8")}`;
+  const expected = crypto
+    .createHmac("sha256", stripeWebhookSecret)
+    .update(payload)
+    .digest("hex");
+  const expectedBuffer = Buffer.from(expected, "hex");
+  const signatureBuffer = Buffer.from(signature, "hex");
+  if (expectedBuffer.length !== signatureBuffer.length) return false;
+  return crypto.timingSafeEqual(expectedBuffer, signatureBuffer);
+}
+
+function parseStripeWebhookEvent(req) {
+  const rawBody = Buffer.isBuffer(req.body)
+    ? req.body
+    : Buffer.from(JSON.stringify(req.body || {}), "utf8");
+  const valid = verifyStripeWebhookSignature(rawBody, req.headers["stripe-signature"]);
+  if (!valid) return null;
+  return JSON.parse(rawBody.toString("utf8"));
+}
+
+async function createStripeCheckoutSession({ product, orderId }) {
+  if (!stripeSecretKey) {
+    const error = new Error("STRIPE_SECRET_KEY is not configured.");
+    error.statusCode = 503;
+    throw error;
+  }
+  const params = new URLSearchParams();
+  params.set("mode", product.mode || "payment");
+  params.set("success_url", buildCommerceReturnUrl("success"));
+  params.set("cancel_url", buildCommerceReturnUrl("cancelled"));
+  params.set("allow_promotion_codes", "true");
+  params.set("billing_address_collection", "auto");
+  params.set("line_items[0][quantity]", "1");
+  params.set("line_items[0][price_data][currency]", product.currency);
+  params.set("line_items[0][price_data][unit_amount]", String(product.amountCents));
+  params.set("line_items[0][price_data][product_data][name]", product.title);
+  params.set("line_items[0][price_data][product_data][description]", product.description);
+  params.set("metadata[order_id]", String(orderId));
+  params.set("metadata[product_id]", product.id);
+  params.set("metadata[product_type]", normalizeCommerceProductType(product.type));
+
+  const response = await fetch(stripeCheckoutSessionsUrl, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${stripeSecretKey}`,
+      "Content-Type": "application/x-www-form-urlencoded",
+    },
+    body: params,
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    const error = new Error(data?.error?.message || "Stripe Checkout failed.");
+    error.statusCode = 502;
+    throw error;
+  }
+  return data;
+}
+
+async function handleStripeWebhookEvent(event) {
+  const type = String(event?.type || "");
+  const session = event?.data?.object || {};
+  const sessionId = String(session?.id || "");
+  if (!sessionId || !type.startsWith("checkout.session.")) return;
+
+  if (type === "checkout.session.completed") {
+    await pool.query(
+      `UPDATE commerce_orders
+       SET status = 'paid',
+           stripe_payment_intent_id = ?,
+           stripe_subscription_id = ?,
+           customer_email = COALESCE(NULLIF(?, ''), customer_email),
+           paid_at = CURRENT_TIMESTAMP,
+           raw_event_json = ?,
+           updated_at = CURRENT_TIMESTAMP
+       WHERE stripe_session_id = ?`,
+      [
+        sanitizeCommerceText(session.payment_intent, 255) || null,
+        sanitizeCommerceText(session.subscription, 255) || null,
+        sanitizeCommerceText(session.customer_details?.email || session.customer_email, 255),
+        JSON.stringify(event),
+        sessionId,
+      ]
+    );
+    return;
+  }
+
+  if (type === "checkout.session.expired") {
+    await pool.query(
+      `UPDATE commerce_orders
+       SET status = 'expired',
+           raw_event_json = ?,
+           updated_at = CURRENT_TIMESTAMP
+       WHERE stripe_session_id = ? AND status = 'pending'`,
+      [JSON.stringify(event), sessionId]
+    );
+    return;
+  }
+
+  if (type === "checkout.session.async_payment_failed") {
+    await pool.query(
+      `UPDATE commerce_orders
+       SET status = 'failed',
+           raw_event_json = ?,
+           updated_at = CURRENT_TIMESTAMP
+       WHERE stripe_session_id = ?`,
+      [JSON.stringify(event), sessionId]
+    );
+  }
 }
 
 function parseStoreTimestampMs(value) {
@@ -2730,6 +2979,32 @@ async function ensureTables() {
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
   `);
   await pool.query(`
+    CREATE TABLE IF NOT EXISTS commerce_orders (
+      id BIGINT NOT NULL AUTO_INCREMENT,
+      product_id VARCHAR(120) NOT NULL,
+      product_type VARCHAR(40) NOT NULL,
+      product_title VARCHAR(220) NOT NULL,
+      amount_cents INT NOT NULL,
+      currency VARCHAR(3) NOT NULL DEFAULT 'usd',
+      status VARCHAR(24) NOT NULL DEFAULT 'pending',
+      customer_email VARCHAR(255) NULL,
+      customer_name VARCHAR(160) NULL,
+      note TEXT NULL,
+      stripe_session_id VARCHAR(255) NULL,
+      stripe_payment_intent_id VARCHAR(255) NULL,
+      stripe_subscription_id VARCHAR(255) NULL,
+      raw_event_json LONGTEXT NULL,
+      paid_at TIMESTAMP NULL DEFAULT NULL,
+      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      PRIMARY KEY (id),
+      UNIQUE KEY uniq_commerce_orders_stripe_session (stripe_session_id),
+      KEY idx_commerce_orders_product_created (product_id, created_at),
+      KEY idx_commerce_orders_status_created (status, created_at),
+      KEY idx_commerce_orders_customer_email (customer_email)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  `);
+  await pool.query(`
     CREATE TABLE IF NOT EXISTS blog_posts (
       id BIGINT NOT NULL AUTO_INCREMENT,
       slug VARCHAR(160) NOT NULL,
@@ -3007,6 +3282,65 @@ app.get("/health", async (req, res) => {
     return res.json({ ok: true });
   } catch (e) {
     res.status(500).json({ ok: false });
+  }
+});
+
+app.get("/commerce/products", async (req, res) => {
+  try {
+    const products = buildCommerceProducts()
+      .filter((product) => product.active === true)
+      .map(publicCommerceProduct);
+    return res.json({ products });
+  } catch (e) {
+    console.error("[commerce-products] failed", e);
+    return res.status(500).json({ message: "Failed to load products." });
+  }
+});
+
+app.post("/commerce/checkout-sessions", async (req, res) => {
+  try {
+    const product = findActiveCommerceProduct(req.body?.productId || defaultCommerceProductId);
+    if (!product) {
+      return res.status(404).json({ message: "This product is not available." });
+    }
+
+    const customerEmail = sanitizeCommerceText(req.body?.customerEmail, 255);
+    const customerName = sanitizeCommerceText(req.body?.customerName, 160);
+    const note = sanitizeCommerceText(req.body?.note, 2000);
+
+    const [orderResult] = await pool.query(
+      `INSERT INTO commerce_orders
+       (product_id, product_type, product_title, amount_cents, currency, status, customer_email, customer_name, note)
+       VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?)`,
+      [
+        product.id,
+        normalizeCommerceProductType(product.type),
+        product.title,
+        product.amountCents,
+        product.currency,
+        customerEmail || null,
+        customerName || null,
+        note || null,
+      ]
+    );
+    const orderId = Number(orderResult?.insertId || 0);
+    const session = await createStripeCheckoutSession({ product, orderId });
+    await pool.query(
+      `UPDATE commerce_orders
+       SET stripe_session_id = ?, updated_at = CURRENT_TIMESTAMP
+       WHERE id = ?`,
+      [String(session.id || ""), orderId]
+    );
+
+    return res.json({
+      id: String(session.id || ""),
+      url: String(session.url || ""),
+    });
+  } catch (e) {
+    console.error("[commerce-checkout] failed", e);
+    return res
+      .status(e?.statusCode || 500)
+      .json({ message: e?.message || "Failed to start checkout." });
   }
 });
 

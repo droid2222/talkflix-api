@@ -36,6 +36,30 @@ Pro/free usage limit admin controls are implemented in:
 - [`entitlements.js`](./entitlements.js): default limits, app setting keys, daily usage helper, and quota accounting
 - [`migrations/005_pro_entitlements_usage_mysql.sql`](./migrations/005_pro_entitlements_usage_mysql.sql)
 
+## Web commerce
+
+Web-only coaching and digital-product sales are separate from mobile in-app purchases.
+
+Implemented endpoints:
+
+- `GET /commerce/products`
+- `POST /commerce/checkout-sessions`
+- `POST /stripe/webhook`
+
+The first active product is `one_on_one_coaching`. Orders are stored in `commerce_orders`; an order is treated as paid only after Stripe webhook confirmation.
+
+Flutter implementation and operational notes are documented in:
+
+```text
+/Users/talkflix/talkflix_flutter/docs/web-commerce.md
+```
+
+Production status on 2026-06-09:
+
+- `/commerce/products` is deployed and returns `one_on_one_coaching`.
+- `/commerce/checkout-sessions` is deployed but cannot create real checkout sessions until `STRIPE_SECRET_KEY` is set.
+- Production backup before deploying these routes: `/root/talkflix-production-backups/20260609-homepage-commerce-api/server.js.before`.
+
 ## Mobile v1 release handoff
 
 The Flutter repository contains the current mobile release handoff:
@@ -131,6 +155,25 @@ The code reads these environment variables:
   - alternative path to the service-account JSON file
 - `GOOGLE_PLAY_CLIENT_EMAIL` and `GOOGLE_PLAY_PRIVATE_KEY`
   - alternative inline service-account credentials
+
+### Web commerce / Stripe
+
+- `STRIPE_SECRET_KEY`
+  - required before real Stripe Checkout sessions can be created
+- `STRIPE_WEBHOOK_SECRET`
+  - required in production so `/stripe/webhook` can verify Stripe events
+- `PUBLIC_WEB_BASE_URL`
+  - default: `https://www.talkflix.cc`
+  - used for coaching checkout success/cancel return URLs
+- `COACHING_PRODUCT_ACTIVE`
+  - default: `true`
+- `COACHING_PRICE_CENTS`
+  - default: `2800`
+- `COACHING_CURRENCY`
+  - default: `usd`
+- `COACHING_PRODUCT_TITLE`
+- `COACHING_PRODUCT_SUBTITLE`
+- `COACHING_PRODUCT_DESCRIPTION`
 
 Notes:
 
