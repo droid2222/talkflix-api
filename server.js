@@ -1366,7 +1366,34 @@ function sanitizeCommerceText(value, maxLength = 1000) {
   return String(value || "").trim().slice(0, maxLength);
 }
 
-function buildCommerceProducts() {
+function normalizeCommerceStatus(value) {
+  const normalized = String(value || "").trim().toLowerCase();
+  if (normalized === "active" || normalized === "draft" || normalized === "archived") {
+    return normalized;
+  }
+  return "draft";
+}
+
+function normalizeCommerceMode(value) {
+  const normalized = String(value || "").trim().toLowerCase();
+  return normalized === "subscription" ? "subscription" : "payment";
+}
+
+function normalizeCommerceSlug(value) {
+  return normalizeBlogSlug(value).slice(0, 120);
+}
+
+function normalizeCommerceProductKey(value) {
+  return String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/['"]/g, "")
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "")
+    .slice(0, 100);
+}
+
+function buildDefaultCommerceProducts() {
   const currency = normalizeCommerceCurrency(process.env.COACHING_CURRENCY || "usd");
   const amountCents = parseBoundedInt(
     process.env.COACHING_PRICE_CENTS,
@@ -1376,6 +1403,9 @@ function buildCommerceProducts() {
   );
   const coachingProduct = {
     id: defaultCommerceProductId,
+    dbId: 0,
+    slug: "one-on-one-coaching",
+    status: envFlag("COACHING_PRODUCT_ACTIVE", true) ? "active" : "draft",
     type: "coaching_session",
     title: sanitizeCommerceText(process.env.COACHING_PRODUCT_TITLE || "1-on-1 Coaching", 160),
     subtitle: sanitizeCommerceText(
@@ -1393,13 +1423,16 @@ function buildCommerceProducts() {
     priceLabel: formatCommercePriceLabel(currency, amountCents),
     mode: "payment",
     active: envFlag("COACHING_PRODUCT_ACTIVE", true),
+    sortOrder: 0,
   };
   return [coachingProduct];
 }
 
 function publicCommerceProduct(product) {
+  const slug = product.slug || normalizeCommerceSlug(product.title || product.id);
   return {
     id: product.id,
+    slug,
     type: product.type,
     title: product.title,
     subtitle: product.subtitle,
@@ -1408,13 +1441,151 @@ function publicCommerceProduct(product) {
     amountCents: product.amountCents,
     priceLabel: product.priceLabel,
     active: product.active === true,
+    shareUrl: `${publicWebBaseUrl}/coaching/${encodeURIComponent(slug)}`,
   };
 }
 
-function findActiveCommerceProduct(productId) {
+function serializeAdminCommerceProduct(product) {
+  return {
+    ...publicCommerceProduct(product),
+    dbId: Number(product.dbId || 0),
+    status: normalizeCommerceStatus(product.status),
+    mode: normalizeCommerceMode(product.mode),
+    sortOrder: Number(product.sortOrder || 0),
+    createdAt: product.createdAt || null,
+    updatedAt: product.updatedAt || null,
+  };
+}
+
+function commerceProductFromRow(row) {
+  const currency = normalizeCommerceCurrency(row.currency || "usd");
+  const amountCents = Number(row.amount_cents || 0);
+  const status = normalizeCommerceStatus(row.status);
+  return {
+    dbId: Number(row.id || 0),
+    id: String(row.product_key || "").trim(),
+    slug: String(row.slug || "").trim(),
+    status,
+    type: normalizeCommerceProductType(row.product_type),
+    title: sanitizeCommerceText(row.title, 220),
+    subtitle: sanitizeCommerceText(row.subtitle, 320),
+    description: sanitizeCommerceText(row.description, 4000),
+    currency,
+    amountCents,
+    priceLabel: formatCommercePriceLabel(currency, amountCents),
+    mode: normalizeCommerceMode(row.checkout_mode),
+    active: status === "active",
+    sortOrder: Number(row.sort_order || 0),
+    createdAt: row.created_at ? new Date(row.created_at).toISOString() : null,
+    updatedAt: row.updated_at ? new Date(row.updated_at).toISOString() : null,
+  };
+}
+
+async function listCommerceProducts({ includeInactive = false, q = "", status = "" } = {}) {
+  try {
+    const where = [];
+    const params = [];
+    const rawStatus = String(status || "").trim().toLowerCase();
+    if (!includeInactive) {
+      where.push("status = 'active'");
+    } else if (["active", "draft", "archived"].includes(rawStatus)) {
+      where.push("status = ?");
+      params.push(rawStatus);
+    }
+    const search = String(q || "").trim();
+    if (search) {
+      where.push("(title LIKE ? OR subtitle LIKE ? OR slug LIKE ? OR product_key LIKE ?)");
+      const like = `%${search}%`;
+      params.push(like, like, like, like);
+    }
+    const whereSql = where.length ? `WHERE ${where.join(" AND ")}` : "";
+    const [rows] = await pool.query(
+      `SELECT *
+       FROM commerce_products
+       ${whereSql}
+       ORDER BY sort_order ASC, updated_at DESC, id DESC`,
+      params
+    );
+    if (!rows?.length && !includeInactive) {
+      return buildDefaultCommerceProducts().filter((product) => product.active);
+    }
+    return (rows || []).map(commerceProductFromRow);
+  } catch (error) {
+    if (error?.code === "ER_NO_SUCH_TABLE") {
+      const products = buildDefaultCommerceProducts();
+      return includeInactive ? products : products.filter((product) => product.active);
+    }
+    throw error;
+  }
+}
+
+async function createUniqueCommerceSlug({ requestedSlug, title, existingId = null }) {
+  const base = normalizeCommerceSlug(requestedSlug) || normalizeCommerceSlug(title) || `product-${Date.now()}`;
+  let candidate = base;
+  for (let i = 1; i <= 50; i += 1) {
+    const params = [candidate];
+    let where = "slug = ?";
+    if (existingId) {
+      where += " AND id <> ?";
+      params.push(Number(existingId));
+    }
+    const [rows] = await pool.query(
+      `SELECT id FROM commerce_products WHERE ${where} LIMIT 1`,
+      params
+    );
+    if (!rows?.length) return candidate;
+    candidate = `${base}-${i + 1}`.slice(0, 120);
+  }
+  return `${base}-${Date.now()}`.slice(0, 120);
+}
+
+async function createUniqueCommerceProductKey({ requestedKey, title, existingId = null }) {
+  const base =
+    normalizeCommerceProductKey(requestedKey) ||
+    normalizeCommerceProductKey(title) ||
+    `product_${Date.now()}`;
+  let candidate = base;
+  for (let i = 1; i <= 50; i += 1) {
+    const params = [candidate];
+    let where = "product_key = ?";
+    if (existingId) {
+      where += " AND id <> ?";
+      params.push(Number(existingId));
+    }
+    const [rows] = await pool.query(
+      `SELECT id FROM commerce_products WHERE ${where} LIMIT 1`,
+      params
+    );
+    if (!rows?.length) return candidate;
+    candidate = `${base}_${i + 1}`.slice(0, 100);
+  }
+  return `${base}_${Date.now()}`.slice(0, 100);
+}
+
+function normalizeCommerceProductPayload(body) {
+  const amountCents = Math.round(Number(body?.amountCents ?? body?.priceCents ?? 0));
+  return {
+    productKey: normalizeCommerceProductKey(body?.productKey),
+    slug: normalizeCommerceSlug(body?.slug),
+    status: normalizeCommerceStatus(body?.status),
+    type: normalizeCommerceProductType(body?.type),
+    title: sanitizeCommerceText(body?.title, 220),
+    subtitle: sanitizeCommerceText(body?.subtitle, 320),
+    description: sanitizeCommerceText(body?.description, 4000),
+    currency: normalizeCommerceCurrency(body?.currency),
+    amountCents,
+    mode: normalizeCommerceMode(body?.mode),
+    sortOrder: Math.max(0, Math.min(100000, Math.round(Number(body?.sortOrder || 0)))),
+  };
+}
+
+async function findActiveCommerceProduct(productId) {
   const normalizedId = String(productId || "").trim();
-  return buildCommerceProducts().find(
-    (product) => product.id === normalizedId && product.active === true
+  const products = await listCommerceProducts({ includeInactive: false });
+  return products.find(
+    (product) =>
+      product.active === true &&
+      (product.id === normalizedId || product.slug === normalizedId)
   );
 }
 
@@ -1480,6 +1651,9 @@ async function createStripeCheckoutSession({ product, orderId }) {
   params.set("line_items[0][price_data][unit_amount]", String(product.amountCents));
   params.set("line_items[0][price_data][product_data][name]", product.title);
   params.set("line_items[0][price_data][product_data][description]", product.description);
+  if (product.mode === "subscription") {
+    params.set("line_items[0][price_data][recurring][interval]", "month");
+  }
   params.set("metadata[order_id]", String(orderId));
   params.set("metadata[product_id]", product.id);
   params.set("metadata[product_type]", normalizeCommerceProductType(product.type));
@@ -3168,6 +3342,33 @@ async function ensureTables() {
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
   `);
   await pool.query(`
+    CREATE TABLE IF NOT EXISTS commerce_products (
+      id BIGINT NOT NULL AUTO_INCREMENT,
+      product_key VARCHAR(120) NOT NULL,
+      slug VARCHAR(160) NOT NULL,
+      status VARCHAR(24) NOT NULL DEFAULT 'draft',
+      product_type VARCHAR(40) NOT NULL DEFAULT 'digital_product',
+      title VARCHAR(220) NOT NULL,
+      subtitle VARCHAR(320) NULL,
+      description TEXT NULL,
+      currency VARCHAR(3) NOT NULL DEFAULT 'usd',
+      amount_cents INT NOT NULL,
+      checkout_mode VARCHAR(24) NOT NULL DEFAULT 'payment',
+      sort_order INT NOT NULL DEFAULT 0,
+      created_by_admin_id INT NULL,
+      updated_by_admin_id INT NULL,
+      created_by_admin_account_id BIGINT NULL,
+      updated_by_admin_account_id BIGINT NULL,
+      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      PRIMARY KEY (id),
+      UNIQUE KEY uniq_commerce_products_key (product_key),
+      UNIQUE KEY uniq_commerce_products_slug (slug),
+      KEY idx_commerce_products_status_sort (status, sort_order),
+      KEY idx_commerce_products_type_status (product_type, status)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  `);
+  await pool.query(`
     CREATE TABLE IF NOT EXISTS commerce_orders (
       id BIGINT NOT NULL AUTO_INCREMENT,
       product_id VARCHAR(120) NOT NULL,
@@ -3193,6 +3394,30 @@ async function ensureTables() {
       KEY idx_commerce_orders_customer_email (customer_email)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
   `);
+  await pool.query(
+    `INSERT IGNORE INTO commerce_products (
+       product_key, slug, status, product_type, title, subtitle, description,
+       currency, amount_cents, checkout_mode, sort_order
+     )
+     VALUES (?, ?, 'active', 'coaching_session', ?, ?, ?, ?, ?, 'payment', 0)`,
+    [
+      defaultCommerceProductId,
+      "one-on-one-coaching",
+      sanitizeCommerceText(process.env.COACHING_PRODUCT_TITLE || "1-on-1 Coaching", 160),
+      sanitizeCommerceText(
+        process.env.COACHING_PRODUCT_SUBTITLE ||
+          "Personal clarity, strategy, and next-step guidance.",
+        240
+      ),
+      sanitizeCommerceText(
+        process.env.COACHING_PRODUCT_DESCRIPTION ||
+          "A focused private coaching session with David Nwako.",
+        1000
+      ),
+      normalizeCommerceCurrency(process.env.COACHING_CURRENCY || "usd"),
+      parseBoundedInt(process.env.COACHING_PRICE_CENTS, 2800, 100, 1000000),
+    ]
+  );
   await pool.query(`
     CREATE TABLE IF NOT EXISTS blog_posts (
       id BIGINT NOT NULL AUTO_INCREMENT,
@@ -3476,7 +3701,7 @@ app.get("/health", async (req, res) => {
 
 app.get("/commerce/products", async (req, res) => {
   try {
-    const products = buildCommerceProducts()
+    const products = (await listCommerceProducts({ includeInactive: false }))
       .filter((product) => product.active === true)
       .map(publicCommerceProduct);
     return res.json({ products });
@@ -3486,9 +3711,24 @@ app.get("/commerce/products", async (req, res) => {
   }
 });
 
+app.get("/commerce/products/:slug", async (req, res) => {
+  try {
+    const slug = normalizeCommerceSlug(req.params.slug);
+    if (!slug) return res.status(400).json({ message: "Invalid product link." });
+    const product = (await listCommerceProducts({ includeInactive: false })).find(
+      (item) => item.slug === slug || item.id === slug
+    );
+    if (!product) return res.status(404).json({ message: "Product not found." });
+    return res.json({ product: publicCommerceProduct(product) });
+  } catch (e) {
+    console.error("[commerce-product] failed", e);
+    return res.status(500).json({ message: "Failed to load product." });
+  }
+});
+
 app.post("/commerce/checkout-sessions", async (req, res) => {
   try {
-    const product = findActiveCommerceProduct(req.body?.productId || defaultCommerceProductId);
+    const product = await findActiveCommerceProduct(req.body?.productId || defaultCommerceProductId);
     if (!product) {
       return res.status(404).json({ message: "This product is not available." });
     }
@@ -3598,6 +3838,189 @@ app.patch("/admin/commerce/stripe-config", requireAuth, requireAdmin, requireSup
     return res
       .status(e?.statusCode || 500)
       .json({ message: e?.message || "Failed to update Stripe configuration." });
+  }
+});
+
+app.get("/admin/commerce/products", requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const products = await listCommerceProducts({
+      includeInactive: true,
+      q: req.query?.q,
+      status: req.query?.status,
+    });
+    return res.json({
+      ok: true,
+      products: products.map(serializeAdminCommerceProduct),
+    });
+  } catch (e) {
+    console.error("[admin-commerce-products] failed", e);
+    return res.status(500).json({ message: "Failed to load commerce products." });
+  }
+});
+
+app.post("/admin/commerce/products", requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const payload = normalizeCommerceProductPayload(req.body || {});
+    if (!payload.title) return res.status(400).json({ message: "Title is required." });
+    if (!payload.description) return res.status(400).json({ message: "Description is required." });
+    if (!Number.isFinite(payload.amountCents) || payload.amountCents < 100) {
+      return res.status(400).json({ message: "Price must be at least 1.00 in the selected currency." });
+    }
+    const actor = getAdminActor(req);
+    const productKey = await createUniqueCommerceProductKey({
+      requestedKey: payload.productKey,
+      title: payload.title,
+    });
+    const slug = await createUniqueCommerceSlug({
+      requestedSlug: payload.slug,
+      title: payload.title,
+    });
+    const [result] = await pool.query(
+      `INSERT INTO commerce_products (
+         product_key, slug, status, product_type, title, subtitle, description,
+         currency, amount_cents, checkout_mode, sort_order,
+         created_by_admin_id, updated_by_admin_id,
+         created_by_admin_account_id, updated_by_admin_account_id
+       )
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        productKey,
+        slug,
+        payload.status,
+        payload.type,
+        payload.title,
+        payload.subtitle || null,
+        payload.description,
+        payload.currency,
+        payload.amountCents,
+        payload.mode,
+        payload.sortOrder,
+        actor.adminId || null,
+        actor.adminId || null,
+        actor.adminAccountId || null,
+        actor.adminAccountId || null,
+      ]
+    );
+    const productId = Number(result?.insertId || 0);
+    await insertAdminAuditLog({
+      ...actor,
+      action: "create-commerce-product",
+      targetType: "commerce_product",
+      targetId: productId,
+      details: { productKey, slug, status: payload.status, amountCents: payload.amountCents },
+    });
+    const [rows] = await pool.query(`SELECT * FROM commerce_products WHERE id = ? LIMIT 1`, [productId]);
+    return res.status(201).json({
+      ok: true,
+      product: serializeAdminCommerceProduct(commerceProductFromRow(rows[0])),
+    });
+  } catch (e) {
+    console.error("[admin-commerce-product-create] failed", e);
+    return res
+      .status(e?.statusCode || 500)
+      .json({ message: e?.message || "Failed to create commerce product." });
+  }
+});
+
+app.put("/admin/commerce/products/:id", requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const productId = Number(req.params.id);
+    if (!productId) return res.status(400).json({ message: "Invalid product id." });
+    const [existingRows] = await pool.query(`SELECT * FROM commerce_products WHERE id = ? LIMIT 1`, [productId]);
+    if (!existingRows?.length) return res.status(404).json({ message: "Commerce product not found." });
+    const payload = normalizeCommerceProductPayload(req.body || {});
+    if (!payload.title) return res.status(400).json({ message: "Title is required." });
+    if (!payload.description) return res.status(400).json({ message: "Description is required." });
+    if (!Number.isFinite(payload.amountCents) || payload.amountCents < 100) {
+      return res.status(400).json({ message: "Price must be at least 1.00 in the selected currency." });
+    }
+    const actor = getAdminActor(req);
+    const slug = await createUniqueCommerceSlug({
+      requestedSlug: payload.slug,
+      title: payload.title,
+      existingId: productId,
+    });
+    await pool.query(
+      `UPDATE commerce_products
+       SET slug = ?,
+           status = ?,
+           product_type = ?,
+           title = ?,
+           subtitle = ?,
+           description = ?,
+           currency = ?,
+           amount_cents = ?,
+           checkout_mode = ?,
+           sort_order = ?,
+           updated_by_admin_id = ?,
+           updated_by_admin_account_id = ?,
+           updated_at = CURRENT_TIMESTAMP
+       WHERE id = ?`,
+      [
+        slug,
+        payload.status,
+        payload.type,
+        payload.title,
+        payload.subtitle || null,
+        payload.description,
+        payload.currency,
+        payload.amountCents,
+        payload.mode,
+        payload.sortOrder,
+        actor.adminId || null,
+        actor.adminAccountId || null,
+        productId,
+      ]
+    );
+    await insertAdminAuditLog({
+      ...actor,
+      action: "update-commerce-product",
+      targetType: "commerce_product",
+      targetId: productId,
+      details: { slug, status: payload.status, amountCents: payload.amountCents },
+    });
+    const [rows] = await pool.query(`SELECT * FROM commerce_products WHERE id = ? LIMIT 1`, [productId]);
+    return res.json({
+      ok: true,
+      product: serializeAdminCommerceProduct(commerceProductFromRow(rows[0])),
+    });
+  } catch (e) {
+    console.error("[admin-commerce-product-update] failed", e);
+    return res
+      .status(e?.statusCode || 500)
+      .json({ message: e?.message || "Failed to update commerce product." });
+  }
+});
+
+app.patch("/admin/commerce/products/:id/archive", requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const productId = Number(req.params.id);
+    if (!productId) return res.status(400).json({ message: "Invalid product id." });
+    const actor = getAdminActor(req);
+    const [result] = await pool.query(
+      `UPDATE commerce_products
+       SET status = 'archived',
+           updated_by_admin_id = ?,
+           updated_by_admin_account_id = ?,
+           updated_at = CURRENT_TIMESTAMP
+       WHERE id = ?`,
+      [actor.adminId || null, actor.adminAccountId || null, productId]
+    );
+    if (!result?.affectedRows) return res.status(404).json({ message: "Commerce product not found." });
+    await insertAdminAuditLog({
+      ...actor,
+      action: "archive-commerce-product",
+      targetType: "commerce_product",
+      targetId: productId,
+    });
+    const [rows] = await pool.query(`SELECT * FROM commerce_products WHERE id = ? LIMIT 1`, [productId]);
+    return res.json({
+      ok: true,
+      product: serializeAdminCommerceProduct(commerceProductFromRow(rows[0])),
+    });
+  } catch (e) {
+    console.error("[admin-commerce-product-archive] failed", e);
+    return res.status(500).json({ message: "Failed to archive commerce product." });
   }
 });
 
