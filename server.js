@@ -2722,8 +2722,11 @@ app.post("/auth/forgot-password", async (req, res) => {
         requestOrigin ||
         (forwardedProto && forwardedHost ? `${forwardedProto}://${forwardedHost}` : null) ||
         `${req.protocol}://${req.get("host")}`;
-      const appUrl = process.env.APP_URL || inferredOrigin || "http://localhost:5173";
-      const resetLink = `${appUrl.replace(/\/$/, "")}/reset-password?token=${token}`;
+      const resetBaseUrl =
+        publicWebBaseUrl ||
+        inferredOrigin ||
+        "https://www.talkflix.cc";
+      const resetLink = `${resetBaseUrl.replace(/\/$/, "")}/reset-password?token=${token}`;
   
       await sendEmail({
         to: normalized,

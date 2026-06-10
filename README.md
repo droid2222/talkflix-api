@@ -184,6 +184,7 @@ The code reads these environment variables:
 - `PUBLIC_WEB_BASE_URL`
   - default: `https://www.talkflix.cc`
   - used for coaching checkout success/cancel return URLs
+  - used for public web links inside emails such as password reset
 - `COACHING_PRODUCT_ACTIVE`
   - default: `true`
 - `COACHING_PRICE_CENTS`
