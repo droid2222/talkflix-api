@@ -1366,6 +1366,19 @@ function sanitizeCommerceText(value, maxLength = 1000) {
   return String(value || "").trim().slice(0, maxLength);
 }
 
+function sanitizeCommerceImageUrl(value) {
+  const normalized = String(value || "").trim().slice(0, 2048);
+  if (!normalized) return "";
+  if (normalized.startsWith("/uploads/")) return normalized;
+  try {
+    const parsed = new URL(normalized);
+    if (parsed.protocol === "https:" || parsed.protocol === "http:") return parsed.toString();
+  } catch {
+    return "";
+  }
+  return "";
+}
+
 function normalizeCommerceStatus(value) {
   const normalized = String(value || "").trim().toLowerCase();
   if (normalized === "active" || normalized === "draft" || normalized === "archived") {
@@ -1418,6 +1431,7 @@ function buildDefaultCommerceProducts() {
         "A focused private coaching session with David Nwako.",
       1000
     ),
+    imageUrl: sanitizeCommerceImageUrl(process.env.COACHING_PRODUCT_IMAGE_URL || ""),
     currency,
     amountCents,
     priceLabel: formatCommercePriceLabel(currency, amountCents),
@@ -1437,6 +1451,7 @@ function publicCommerceProduct(product) {
     title: product.title,
     subtitle: product.subtitle,
     description: product.description,
+    imageUrl: sanitizeCommerceImageUrl(product.imageUrl),
     currency: String(product.currency || "usd").toUpperCase(),
     amountCents: product.amountCents,
     priceLabel: product.priceLabel,
@@ -1470,6 +1485,7 @@ function commerceProductFromRow(row) {
     title: sanitizeCommerceText(row.title, 220),
     subtitle: sanitizeCommerceText(row.subtitle, 320),
     description: sanitizeCommerceText(row.description, 4000),
+    imageUrl: sanitizeCommerceImageUrl(row.image_url),
     currency,
     amountCents,
     priceLabel: formatCommercePriceLabel(currency, amountCents),
@@ -1572,6 +1588,7 @@ function normalizeCommerceProductPayload(body) {
     title: sanitizeCommerceText(body?.title, 220),
     subtitle: sanitizeCommerceText(body?.subtitle, 320),
     description: sanitizeCommerceText(body?.description, 4000),
+    imageUrl: sanitizeCommerceImageUrl(body?.imageUrl ?? body?.image_url),
     currency: normalizeCommerceCurrency(body?.currency),
     amountCents,
     mode: normalizeCommerceMode(body?.mode),
@@ -3351,6 +3368,7 @@ async function ensureTables() {
       title VARCHAR(220) NOT NULL,
       subtitle VARCHAR(320) NULL,
       description TEXT NULL,
+      image_url LONGTEXT NULL,
       currency VARCHAR(3) NOT NULL DEFAULT 'usd',
       amount_cents INT NOT NULL,
       checkout_mode VARCHAR(24) NOT NULL DEFAULT 'payment',
@@ -3394,12 +3412,28 @@ async function ensureTables() {
       KEY idx_commerce_orders_customer_email (customer_email)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
   `);
+  const commerceProductAlterStatements = [
+    "ALTER TABLE commerce_products ADD COLUMN image_url LONGTEXT NULL AFTER description",
+  ];
+  for (const sql of commerceProductAlterStatements) {
+    try {
+      await pool.query(sql);
+    } catch (e) {
+      if (
+        e?.code !== "ER_DUP_FIELDNAME" &&
+        e?.code !== "ER_BAD_FIELD_ERROR" &&
+        e?.code !== "ER_NO_SUCH_TABLE"
+      ) {
+        console.error(e);
+      }
+    }
+  }
   await pool.query(
     `INSERT IGNORE INTO commerce_products (
-       product_key, slug, status, product_type, title, subtitle, description,
+       product_key, slug, status, product_type, title, subtitle, description, image_url,
        currency, amount_cents, checkout_mode, sort_order
      )
-     VALUES (?, ?, 'active', 'coaching_session', ?, ?, ?, ?, ?, 'payment', 0)`,
+     VALUES (?, ?, 'active', 'coaching_session', ?, ?, ?, ?, ?, ?, 'payment', 0)`,
     [
       defaultCommerceProductId,
       "one-on-one-coaching",
@@ -3414,6 +3448,7 @@ async function ensureTables() {
           "A focused private coaching session with David Nwako.",
         1000
       ),
+      sanitizeCommerceImageUrl(process.env.COACHING_PRODUCT_IMAGE_URL || ""),
       normalizeCommerceCurrency(process.env.COACHING_CURRENCY || "usd"),
       parseBoundedInt(process.env.COACHING_PRICE_CENTS, 2800, 100, 1000000),
     ]
@@ -3841,6 +3876,28 @@ app.patch("/admin/commerce/stripe-config", requireAuth, requireAdmin, requireSup
   }
 });
 
+app.post("/admin/commerce/upload-image", requireAuth, requireAdmin, upload.single("image"), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ message: "Image file is required." });
+    const mime = String(req.file.mimetype || "").toLowerCase();
+    if (!mime.startsWith("image/")) {
+      removeUploadByPublicUrl(`/uploads/${req.file.filename}`);
+      return res.status(400).json({ message: "Only image uploads are allowed." });
+    }
+    const publicUrl = `/uploads/${req.file.filename}`;
+    await insertAdminAuditLog({
+      ...getAdminActor(req),
+      action: "upload-commerce-image",
+      targetType: "commerce_image",
+      details: { publicUrl },
+    });
+    return res.json({ ok: true, url: publicUrl });
+  } catch (e) {
+    console.error("[admin-commerce-upload-image] failed", e);
+    return res.status(500).json({ message: "Failed to upload commerce image." });
+  }
+});
+
 app.get("/admin/commerce/products", requireAuth, requireAdmin, async (req, res) => {
   try {
     const products = await listCommerceProducts({
@@ -3877,12 +3934,12 @@ app.post("/admin/commerce/products", requireAuth, requireAdmin, async (req, res)
     });
     const [result] = await pool.query(
       `INSERT INTO commerce_products (
-         product_key, slug, status, product_type, title, subtitle, description,
+         product_key, slug, status, product_type, title, subtitle, description, image_url,
          currency, amount_cents, checkout_mode, sort_order,
          created_by_admin_id, updated_by_admin_id,
          created_by_admin_account_id, updated_by_admin_account_id
        )
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         productKey,
         slug,
@@ -3891,6 +3948,7 @@ app.post("/admin/commerce/products", requireAuth, requireAdmin, async (req, res)
         payload.title,
         payload.subtitle || null,
         payload.description,
+        payload.imageUrl || null,
         payload.currency,
         payload.amountCents,
         payload.mode,
@@ -3907,7 +3965,13 @@ app.post("/admin/commerce/products", requireAuth, requireAdmin, async (req, res)
       action: "create-commerce-product",
       targetType: "commerce_product",
       targetId: productId,
-      details: { productKey, slug, status: payload.status, amountCents: payload.amountCents },
+      details: {
+        productKey,
+        slug,
+        status: payload.status,
+        amountCents: payload.amountCents,
+        hasImage: Boolean(payload.imageUrl),
+      },
     });
     const [rows] = await pool.query(`SELECT * FROM commerce_products WHERE id = ? LIMIT 1`, [productId]);
     return res.status(201).json({
@@ -3948,6 +4012,7 @@ app.put("/admin/commerce/products/:id", requireAuth, requireAdmin, async (req, r
            title = ?,
            subtitle = ?,
            description = ?,
+           image_url = ?,
            currency = ?,
            amount_cents = ?,
            checkout_mode = ?,
@@ -3963,6 +4028,7 @@ app.put("/admin/commerce/products/:id", requireAuth, requireAdmin, async (req, r
         payload.title,
         payload.subtitle || null,
         payload.description,
+        payload.imageUrl || null,
         payload.currency,
         payload.amountCents,
         payload.mode,
@@ -3977,7 +4043,12 @@ app.put("/admin/commerce/products/:id", requireAuth, requireAdmin, async (req, r
       action: "update-commerce-product",
       targetType: "commerce_product",
       targetId: productId,
-      details: { slug, status: payload.status, amountCents: payload.amountCents },
+      details: {
+        slug,
+        status: payload.status,
+        amountCents: payload.amountCents,
+        hasImage: Boolean(payload.imageUrl),
+      },
     });
     const [rows] = await pool.query(`SELECT * FROM commerce_products WHERE id = ? LIMIT 1`, [productId]);
     return res.json({
