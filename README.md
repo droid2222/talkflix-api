@@ -50,9 +50,10 @@ Implemented endpoints:
 - `POST /admin/commerce/products`
 - `PUT /admin/commerce/products/:id`
 - `PATCH /admin/commerce/products/:id/archive`
+- `DELETE /admin/commerce/products/:id`
 - `POST /admin/commerce/upload-image`
 
-The first active product is `one_on_one_coaching` with share link `https://www.talkflix.cc/coaching/one-on-one-coaching`. Products are stored in `commerce_products`; product responses include `imageUrl` when a cover image is configured. Orders are stored in `commerce_orders`; an order is treated as paid only after Stripe webhook confirmation.
+The first active product is `one_on_one_coaching` with share link `https://www.talkflix.cc/coaching/one-on-one-coaching`. Products are stored in `commerce_products`; product responses include `imageUrl` when a cover image is configured. Orders are stored in `commerce_orders` with selected quantity; an order is treated as paid only after Stripe webhook confirmation.
 
 Flutter implementation and operational notes are documented in:
 
@@ -64,15 +65,16 @@ Production status on 2026-06-10:
 
 - `/commerce/products` is deployed and returns active products with `shareUrl` and `imageUrl`.
 - `/commerce/products/one-on-one-coaching` is deployed for specific product share links.
-- `/commerce/checkout-sessions` is deployed and returned a Stripe Checkout URL after the dashboard Stripe secret was configured.
+- `/commerce/checkout-sessions` is deployed and accepts `quantity` from 1 to 99.
 - `/admin/commerce/stripe-config` is deployed so a super admin can save/clear the Stripe secret key and webhook secret from the admin dashboard.
-- `/admin/commerce/products` is deployed so an admin can create, edit, archive, search, filter, and copy links for coaching/products.
+- `/admin/commerce/products` is deployed so an admin can create, edit, archive, delete, search, filter, and copy links for coaching/products.
 - `/admin/commerce/upload-image` is deployed for authenticated product cover uploads.
 - Dashboard-saved Stripe secrets are encrypted in `app_settings`, masked on read, and never returned to the browser after saving.
 - Production backup before deploying these routes: `/root/talkflix-production-backups/20260609-homepage-commerce-api/server.js.before`.
 - Production backup before adding dashboard Stripe settings: `/root/talkflix-production-backups/20260609-admin-stripe-config/server.js.before`.
 - Production backup before adding product management and share links: `/root/talkflix-production-backups/20260609-commerce-products/`.
 - Production backup before adding cover images and the public catalog: `/root/talkflix-production-backups/20260610-commerce-cover-catalog/`.
+- Production backup before adding catalog search, quantity checkout, and delete: `/root/talkflix-production-backups/20260610-commerce-catalog-search-quantity-delete/`.
 
 ## Mobile v1 release handoff
 

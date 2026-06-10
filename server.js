@@ -1596,6 +1596,12 @@ function normalizeCommerceProductPayload(body) {
   };
 }
 
+function normalizeCommerceQuantity(value) {
+  const parsed = Math.round(Number(value || 1));
+  if (!Number.isFinite(parsed)) return 1;
+  return Math.max(1, Math.min(99, parsed));
+}
+
 async function findActiveCommerceProduct(productId) {
   const normalizedId = String(productId || "").trim();
   const products = await listCommerceProducts({ includeInactive: false });
@@ -1650,7 +1656,7 @@ async function parseStripeWebhookEvent(req) {
   return JSON.parse(rawBody.toString("utf8"));
 }
 
-async function createStripeCheckoutSession({ product, orderId }) {
+async function createStripeCheckoutSession({ product, orderId, quantity = 1 }) {
   const { value: secretKey } = await readEffectiveStripeSecretKey();
   if (!secretKey) {
     const error = new Error("STRIPE_SECRET_KEY is not configured.");
@@ -1663,7 +1669,7 @@ async function createStripeCheckoutSession({ product, orderId }) {
   params.set("cancel_url", buildCommerceReturnUrl("cancelled"));
   params.set("allow_promotion_codes", "true");
   params.set("billing_address_collection", "auto");
-  params.set("line_items[0][quantity]", "1");
+  params.set("line_items[0][quantity]", String(normalizeCommerceQuantity(quantity)));
   params.set("line_items[0][price_data][currency]", product.currency);
   params.set("line_items[0][price_data][unit_amount]", String(product.amountCents));
   params.set("line_items[0][price_data][product_data][name]", product.title);
@@ -1674,6 +1680,7 @@ async function createStripeCheckoutSession({ product, orderId }) {
   params.set("metadata[order_id]", String(orderId));
   params.set("metadata[product_id]", product.id);
   params.set("metadata[product_type]", normalizeCommerceProductType(product.type));
+  params.set("metadata[quantity]", String(normalizeCommerceQuantity(quantity)));
 
   const response = await fetch(stripeCheckoutSessionsUrl, {
     method: "POST",
@@ -3392,6 +3399,7 @@ async function ensureTables() {
       product_id VARCHAR(120) NOT NULL,
       product_type VARCHAR(40) NOT NULL,
       product_title VARCHAR(220) NOT NULL,
+      quantity INT NOT NULL DEFAULT 1,
       amount_cents INT NOT NULL,
       currency VARCHAR(3) NOT NULL DEFAULT 'usd',
       status VARCHAR(24) NOT NULL DEFAULT 'pending',
@@ -3416,6 +3424,22 @@ async function ensureTables() {
     "ALTER TABLE commerce_products ADD COLUMN image_url LONGTEXT NULL AFTER description",
   ];
   for (const sql of commerceProductAlterStatements) {
+    try {
+      await pool.query(sql);
+    } catch (e) {
+      if (
+        e?.code !== "ER_DUP_FIELDNAME" &&
+        e?.code !== "ER_BAD_FIELD_ERROR" &&
+        e?.code !== "ER_NO_SUCH_TABLE"
+      ) {
+        console.error(e);
+      }
+    }
+  }
+  const commerceOrderAlterStatements = [
+    "ALTER TABLE commerce_orders ADD COLUMN quantity INT NOT NULL DEFAULT 1 AFTER product_title",
+  ];
+  for (const sql of commerceOrderAlterStatements) {
     try {
       await pool.query(sql);
     } catch (e) {
@@ -3771,16 +3795,19 @@ app.post("/commerce/checkout-sessions", async (req, res) => {
     const customerEmail = sanitizeCommerceText(req.body?.customerEmail, 255);
     const customerName = sanitizeCommerceText(req.body?.customerName, 160);
     const note = sanitizeCommerceText(req.body?.note, 2000);
+    const quantity = normalizeCommerceQuantity(req.body?.quantity);
+    const totalAmountCents = product.amountCents * quantity;
 
     const [orderResult] = await pool.query(
       `INSERT INTO commerce_orders
-       (product_id, product_type, product_title, amount_cents, currency, status, customer_email, customer_name, note)
-       VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?)`,
+       (product_id, product_type, product_title, quantity, amount_cents, currency, status, customer_email, customer_name, note)
+       VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)`,
       [
         product.id,
         normalizeCommerceProductType(product.type),
         product.title,
-        product.amountCents,
+        quantity,
+        totalAmountCents,
         product.currency,
         customerEmail || null,
         customerName || null,
@@ -3788,7 +3815,7 @@ app.post("/commerce/checkout-sessions", async (req, res) => {
       ]
     );
     const orderId = Number(orderResult?.insertId || 0);
-    const session = await createStripeCheckoutSession({ product, orderId });
+    const session = await createStripeCheckoutSession({ product, orderId, quantity });
     await pool.query(
       `UPDATE commerce_orders
        SET stripe_session_id = ?, updated_at = CURRENT_TIMESTAMP
@@ -4092,6 +4119,33 @@ app.patch("/admin/commerce/products/:id/archive", requireAuth, requireAdmin, asy
   } catch (e) {
     console.error("[admin-commerce-product-archive] failed", e);
     return res.status(500).json({ message: "Failed to archive commerce product." });
+  }
+});
+
+app.delete("/admin/commerce/products/:id", requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const productId = Number(req.params.id);
+    if (!productId) return res.status(400).json({ message: "Invalid product id." });
+    const [rows] = await pool.query(`SELECT * FROM commerce_products WHERE id = ? LIMIT 1`, [productId]);
+    if (!rows?.length) return res.status(404).json({ message: "Commerce product not found." });
+    const product = commerceProductFromRow(rows[0]);
+    const actor = getAdminActor(req);
+    await pool.query(`DELETE FROM commerce_products WHERE id = ?`, [productId]);
+    await insertAdminAuditLog({
+      ...actor,
+      action: "delete-commerce-product",
+      targetType: "commerce_product",
+      targetId: productId,
+      details: {
+        productKey: product.id,
+        slug: product.slug,
+        title: product.title,
+      },
+    });
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error("[admin-commerce-product-delete] failed", e);
+    return res.status(500).json({ message: "Failed to delete commerce product." });
   }
 });
 
