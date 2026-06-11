@@ -181,9 +181,20 @@ The code reads these environment variables:
   - required before real Stripe Checkout sessions can be created
 - `STRIPE_WEBHOOK_SECRET`
   - required in production so `/stripe/webhook` can verify Stripe events
+- `STRIPE_PRO_MONTHLY_PRICE_ID`, `STRIPE_PRO_6_MONTHS_PRICE_ID`, `STRIPE_PRO_YEARLY_PRICE_ID`
+  - optional Stripe recurring Price IDs for web Talkflix Pro checkout
+  - if omitted, the backend creates recurring Checkout price data from the amount-cent settings below
+- `STRIPE_PRO_MONTHLY_AMOUNT_CENTS`
+  - default: `999`
+- `STRIPE_PRO_6_MONTHS_AMOUNT_CENTS`
+  - default: `4999`
+- `STRIPE_PRO_YEARLY_AMOUNT_CENTS`
+  - default: `8999`
+- `STRIPE_PRO_CURRENCY`
+  - default: `usd`
 - `PUBLIC_WEB_BASE_URL`
   - default: `https://www.talkflix.cc`
-  - used for coaching checkout success/cancel return URLs
+  - used for coaching and web Pro checkout success/cancel return URLs
   - used for public web links inside emails such as password reset
 - `COACHING_PRODUCT_ACTIVE`
   - default: `true`

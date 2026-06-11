@@ -1,8 +1,20 @@
 # Production Database Migration Status
 
-Last verified: 2026-06-07
+Last verified: 2026-06-11
 
 This document records production schema checks that were performed for the v1 mobile release.
+
+## 2026-06-11 Stripe Pro Subscription Migration
+
+`migrations/006_stripe_pro_subscriptions_mysql.sql` adds `stripe_pro_subscriptions`, the backend audit/link table used to map Stripe subscription webhooks back to Talkflix users for web Pro checkout.
+
+The backend also creates this table at startup through `ensureTables`.
+
+Production verification after deploy:
+
+```text
+table:stripe_pro_subscriptions|1
+```
 
 ## 2026-06-07 Pro Entitlements Migration
 
@@ -61,6 +73,7 @@ migrations/002_content_feed_upgrade_mysql.sql
 migrations/003_mobile_iap_purchases_mysql.sql
 migrations/004_direct_call_receive_defaults_mysql.sql
 migrations/005_pro_entitlements_usage_mysql.sql
+migrations/006_stripe_pro_subscriptions_mysql.sql
 ```
 
 ## Handoff Rule
