@@ -152,6 +152,41 @@ const defaultIapProProductIds = [
   "talkflix_pro_6_months",
   "talkflix_pro_yearly",
 ];
+const defaultStripeProPlans = [
+  {
+    id: "talkflix_pro_monthly_v2",
+    label: "1 MONTH",
+    months: 1,
+    interval: "month",
+    intervalCount: 1,
+    amountCents: 999,
+    priceIdEnv: "STRIPE_PRO_MONTHLY_PRICE_ID",
+    amountEnv: "STRIPE_PRO_MONTHLY_AMOUNT_CENTS",
+    popular: false,
+  },
+  {
+    id: "talkflix_pro_6_months",
+    label: "6 MONTHS",
+    months: 6,
+    interval: "month",
+    intervalCount: 6,
+    amountCents: 4999,
+    priceIdEnv: "STRIPE_PRO_6_MONTHS_PRICE_ID",
+    amountEnv: "STRIPE_PRO_6_MONTHS_AMOUNT_CENTS",
+    popular: false,
+  },
+  {
+    id: "talkflix_pro_yearly",
+    label: "12 MONTHS",
+    months: 12,
+    interval: "year",
+    intervalCount: 1,
+    amountCents: 8999,
+    priceIdEnv: "STRIPE_PRO_YEARLY_PRICE_ID",
+    amountEnv: "STRIPE_PRO_YEARLY_AMOUNT_CENTS",
+    popular: true,
+  },
+];
 const iapProProductIds = new Set(
   String(process.env.IAP_PRO_PRODUCT_IDS || defaultIapProProductIds.join(","))
     .split(",")
@@ -1158,6 +1193,60 @@ app.post("/billing/start-trial", requireAuth, async (req, res) => {
   }
 });
 
+app.get("/billing/pro/stripe-plans", async (req, res) => {
+  try {
+    const { value: secretKey } = await readEffectiveStripeSecretKey();
+    return res.json({
+      ok: true,
+      checkoutAvailable: Boolean(secretKey),
+      plans: readStripeProPlans().map(publicStripeProPlan),
+    });
+  } catch (error) {
+    console.error("[billing] Stripe Pro plans failed", error);
+    return res.status(500).json({ message: "Failed to load Pro plans." });
+  }
+});
+
+app.post("/billing/pro/stripe-checkout-sessions", requireAuth, async (req, res) => {
+  try {
+    const userId = Number(req.user.sub);
+    if (!userId) {
+      return res.status(401).json({ message: "Unauthorized" });
+    }
+    const plan = findStripeProPlan(req.body?.planId);
+    if (!plan) {
+      return res.status(400).json({ message: "Unknown Talkflix Pro plan." });
+    }
+
+    const [rows] = await pool.query(
+      `SELECT id, email, role, plan, pro_ends_at
+         FROM users
+        WHERE id = ? AND deleted_at IS NULL
+        LIMIT 1`,
+      [userId]
+    );
+    const user = rows?.[0];
+    if (!user) {
+      return res.status(404).json({ message: "User not found." });
+    }
+
+    const session = await createStripeProCheckoutSession({
+      userId,
+      userEmail: user.email,
+      plan,
+    });
+    return res.json({
+      id: String(session.id || ""),
+      url: String(session.url || ""),
+    });
+  } catch (error) {
+    console.error("[billing] Stripe Pro checkout failed", error);
+    return res
+      .status(error?.statusCode || 500)
+      .json({ message: error?.message || "Failed to start Stripe checkout." });
+  }
+});
+
 app.post("/billing/iap/verify", requireAuth, async (req, res) => {
   try {
     const userId = Number(req.user.sub);
@@ -1617,6 +1706,71 @@ function buildCommerceReturnUrl(status) {
   return `${publicWebBaseUrl}/coaching?checkout=${normalizedStatus}`;
 }
 
+function buildProCheckoutReturnUrl(status) {
+  const normalizedStatus = status === "success" ? "success" : "cancelled";
+  return `${publicWebBaseUrl}/app/upgrade?checkout=${normalizedStatus}`;
+}
+
+function normalizeStripeProCurrency(value) {
+  const normalized = String(value || "usd").trim().toLowerCase();
+  return /^[a-z]{3}$/.test(normalized) ? normalized : "usd";
+}
+
+function readStripeProPlans() {
+  const currency = normalizeStripeProCurrency(process.env.STRIPE_PRO_CURRENCY);
+  return defaultStripeProPlans.map((plan) => {
+    const amountOverride = parseInt(String(process.env[plan.amountEnv] || ""), 10);
+    const amountCents = Number.isFinite(amountOverride) && amountOverride > 0
+      ? amountOverride
+      : plan.amountCents;
+    return {
+      ...plan,
+      currency,
+      amountCents,
+      priceId: String(process.env[plan.priceIdEnv] || "").trim(),
+    };
+  });
+}
+
+function findStripeProPlan(planId) {
+  const normalized = String(planId || "").trim();
+  return readStripeProPlans().find((plan) => plan.id === normalized);
+}
+
+function formatStripeProMoney(amountCents, currency) {
+  const amount = Math.max(0, Number(amountCents || 0)) / 100;
+  try {
+    return new Intl.NumberFormat("en-US", {
+      style: "currency",
+      currency: String(currency || "usd").toUpperCase(),
+    }).format(amount);
+  } catch (_) {
+    return `${String(currency || "usd").toUpperCase()} ${amount.toFixed(2)}`;
+  }
+}
+
+function publicStripeProPlan(plan) {
+  const months = Math.max(1, Number(plan.months || 1));
+  return {
+    id: plan.id,
+    label: plan.label,
+    months,
+    currency: plan.currency,
+    amountCents: plan.amountCents,
+    price: formatStripeProMoney(plan.amountCents, plan.currency),
+    monthlyPrice: formatStripeProMoney(Math.round(plan.amountCents / months), plan.currency),
+    popular: plan.popular === true,
+  };
+}
+
+function addMonths(date, months) {
+  const result = new Date(date.getTime());
+  const originalDay = result.getDate();
+  result.setMonth(result.getMonth() + Math.max(1, Number(months || 1)));
+  if (result.getDate() < originalDay) result.setDate(0);
+  return result;
+}
+
 async function verifyStripeWebhookSignature(rawBody, signatureHeader) {
   const { value: webhookSecret } = await readEffectiveStripeWebhookSecret();
   if (!webhookSecret) {
@@ -1699,11 +1853,197 @@ async function createStripeCheckoutSession({ product, orderId, quantity = 1 }) {
   return data;
 }
 
+async function createStripeProCheckoutSession({ userId, userEmail, plan }) {
+  const { value: secretKey } = await readEffectiveStripeSecretKey();
+  if (!secretKey) {
+    const error = new Error("STRIPE_SECRET_KEY is not configured.");
+    error.statusCode = 503;
+    throw error;
+  }
+
+  const params = new URLSearchParams();
+  params.set("mode", "subscription");
+  params.set("success_url", buildProCheckoutReturnUrl("success"));
+  params.set("cancel_url", buildProCheckoutReturnUrl("cancelled"));
+  params.set("allow_promotion_codes", "true");
+  params.set("billing_address_collection", "auto");
+  params.set("client_reference_id", String(userId));
+  if (userEmail) params.set("customer_email", String(userEmail));
+
+  if (plan.priceId) {
+    params.set("line_items[0][price]", plan.priceId);
+  } else {
+    params.set("line_items[0][price_data][currency]", plan.currency);
+    params.set("line_items[0][price_data][unit_amount]", String(plan.amountCents));
+    params.set("line_items[0][price_data][product_data][name]", `Talkflix Pro ${plan.label}`);
+    params.set(
+      "line_items[0][price_data][product_data][description]",
+      "Unlimited Talkflix Pro access for videos, podcasts, calls, rooms, stage time, and chat translations."
+    );
+    params.set("line_items[0][price_data][recurring][interval]", plan.interval);
+    params.set("line_items[0][price_data][recurring][interval_count]", String(plan.intervalCount));
+  }
+  params.set("line_items[0][quantity]", "1");
+  params.set("metadata[billing_kind]", "talkflix_pro");
+  params.set("metadata[user_id]", String(userId));
+  params.set("metadata[plan_id]", plan.id);
+  params.set("subscription_data[metadata][billing_kind]", "talkflix_pro");
+  params.set("subscription_data[metadata][user_id]", String(userId));
+  params.set("subscription_data[metadata][plan_id]", plan.id);
+
+  const response = await fetch(stripeCheckoutSessionsUrl, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${secretKey}`,
+      "Content-Type": "application/x-www-form-urlencoded",
+    },
+    body: params,
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    const error = new Error(data?.error?.message || "Stripe Checkout failed.");
+    error.statusCode = 502;
+    throw error;
+  }
+  return data;
+}
+
+async function activateStripeProSubscription({
+  userId,
+  plan,
+  stripeSessionId = "",
+  stripeCustomerId = "",
+  stripeSubscriptionId = "",
+  stripeStatus = "active",
+  expiresAt,
+  rawEvent,
+}) {
+  const safeExpiresAt = expiresAt instanceof Date && !Number.isNaN(expiresAt.getTime())
+    ? expiresAt
+    : addMonths(new Date(), plan.months);
+
+  await pool.query(
+    `INSERT INTO stripe_pro_subscriptions
+       (user_id, plan_id, stripe_customer_id, stripe_subscription_id,
+        stripe_session_id, status, current_period_end, last_event_json)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+     ON DUPLICATE KEY UPDATE
+       user_id = VALUES(user_id),
+       plan_id = VALUES(plan_id),
+       stripe_customer_id = COALESCE(NULLIF(VALUES(stripe_customer_id), ''), stripe_customer_id),
+       stripe_subscription_id = COALESCE(NULLIF(VALUES(stripe_subscription_id), ''), stripe_subscription_id),
+       stripe_session_id = COALESCE(NULLIF(VALUES(stripe_session_id), ''), stripe_session_id),
+       status = VALUES(status),
+       current_period_end = VALUES(current_period_end),
+       last_event_json = VALUES(last_event_json),
+       updated_at = CURRENT_TIMESTAMP`,
+    [
+      userId,
+      plan.id,
+      stripeCustomerId ? String(stripeCustomerId) : null,
+      stripeSubscriptionId ? String(stripeSubscriptionId) : null,
+      stripeSessionId ? String(stripeSessionId) : null,
+      String(stripeStatus || "active"),
+      safeExpiresAt,
+      JSON.stringify(rawEvent || {}),
+    ]
+  );
+
+  await pool.query(
+    `UPDATE users
+        SET plan = 'pro',
+            pro_ends_at = CASE
+              WHEN plan = 'pro' AND pro_ends_at IS NULL THEN NULL
+              WHEN pro_ends_at IS NOT NULL AND pro_ends_at > ? THEN pro_ends_at
+              ELSE ?
+            END
+      WHERE id = ? AND deleted_at IS NULL`,
+    [safeExpiresAt, safeExpiresAt, userId]
+  );
+}
+
 async function handleStripeWebhookEvent(event) {
   const type = String(event?.type || "");
   const session = event?.data?.object || {};
   const sessionId = String(session?.id || "");
+  if (type === "invoice.paid") {
+    const subscriptionId = String(session?.subscription || "");
+    if (!subscriptionId) return;
+    const [rows] = await pool.query(
+      `SELECT user_id, plan_id
+         FROM stripe_pro_subscriptions
+        WHERE stripe_subscription_id = ?
+        LIMIT 1`,
+      [subscriptionId]
+    );
+    const existing = rows?.[0];
+    if (!existing) return;
+    const plan = findStripeProPlan(existing.plan_id);
+    if (!plan) return;
+    const periodEndSeconds = Number(session?.lines?.data?.[0]?.period?.end || 0);
+    const expiresAt = periodEndSeconds > 0
+      ? new Date(periodEndSeconds * 1000)
+      : addMonths(new Date(), plan.months);
+    await activateStripeProSubscription({
+      userId: Number(existing.user_id),
+      plan,
+      stripeCustomerId: session?.customer,
+      stripeSubscriptionId: subscriptionId,
+      stripeStatus: "active",
+      expiresAt,
+      rawEvent: event,
+    });
+    return;
+  }
+
+  if (type === "customer.subscription.deleted") {
+    const subscriptionId = String(session?.id || "");
+    if (!subscriptionId) return;
+    const currentPeriodEnd = Number(session?.current_period_end || 0);
+    const expiresAt = currentPeriodEnd > 0 ? new Date(currentPeriodEnd * 1000) : new Date();
+    await pool.query(
+      `UPDATE stripe_pro_subscriptions
+          SET status = 'cancelled',
+              current_period_end = ?,
+              last_event_json = ?,
+              updated_at = CURRENT_TIMESTAMP
+        WHERE stripe_subscription_id = ?`,
+      [expiresAt, JSON.stringify(event), subscriptionId]
+    );
+    await pool.query(
+      `UPDATE users u
+          JOIN stripe_pro_subscriptions s ON s.user_id = u.id
+         SET u.pro_ends_at = ?
+       WHERE s.stripe_subscription_id = ?
+         AND u.plan = 'pro'
+         AND (u.pro_ends_at IS NULL OR u.pro_ends_at > ?)`,
+      [expiresAt, subscriptionId, expiresAt]
+    );
+    return;
+  }
+
   if (!sessionId || !type.startsWith("checkout.session.")) return;
+
+  if (session?.metadata?.billing_kind === "talkflix_pro") {
+    if (type !== "checkout.session.completed") return;
+    const paymentStatus = String(session?.payment_status || "");
+    if (paymentStatus && !["paid", "no_payment_required"].includes(paymentStatus)) return;
+    const userId = Number(session?.metadata?.user_id || session?.client_reference_id || 0);
+    const plan = findStripeProPlan(session?.metadata?.plan_id);
+    if (!userId || !plan) return;
+    const status = String(session?.subscription_status || session?.status || "active");
+    await activateStripeProSubscription({
+      userId,
+      plan,
+      stripeSessionId: sessionId,
+      stripeCustomerId: session?.customer,
+      stripeSubscriptionId: session?.subscription,
+      stripeStatus: status,
+      expiresAt: addMonths(new Date(), plan.months),
+      rawEvent: event,
+    });
+    return;
+  }
 
   if (type === "checkout.session.completed") {
     await pool.query(
@@ -3366,6 +3706,27 @@ async function ensureTables() {
       KEY idx_iap_purchases_user_expires (user_id, expires_at),
       KEY idx_iap_purchases_product_expires (product_id, expires_at),
       CONSTRAINT fk_iap_purchases_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS stripe_pro_subscriptions (
+      id BIGINT NOT NULL AUTO_INCREMENT,
+      user_id INT NOT NULL,
+      plan_id VARCHAR(160) NOT NULL,
+      stripe_customer_id VARCHAR(255) NULL,
+      stripe_subscription_id VARCHAR(255) NULL,
+      stripe_session_id VARCHAR(255) NULL,
+      status VARCHAR(80) NOT NULL DEFAULT 'active',
+      current_period_end TIMESTAMP NULL DEFAULT NULL,
+      last_event_json LONGTEXT NULL,
+      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      PRIMARY KEY (id),
+      UNIQUE KEY uniq_stripe_pro_subscription (stripe_subscription_id),
+      UNIQUE KEY uniq_stripe_pro_session (stripe_session_id),
+      KEY idx_stripe_pro_user_period (user_id, current_period_end),
+      KEY idx_stripe_pro_plan_period (plan_id, current_period_end),
+      CONSTRAINT fk_stripe_pro_subscriptions_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
   `);
   await pool.query(`
